@@ -1,0 +1,314 @@
+@prefix doap:  <http://usefulinc.com/ns/doap#> .
+@prefix foaf:  <http://xmlns.com/foaf/0.1/> .
+@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix units: <http://lv2plug.in/ns/extensions/units#> .
+@prefix ui:    <http://lv2plug.in/ns/extensions/ui#> .
+@prefix pg:    <http://lv2plug.in/ns/ext/port-groups#> .
+
+<https://nylarea.com/nlsounds#me>
+	a foaf:Person ;
+	foaf:name "NL Sounds" ;
+	foaf:homepage <https://github.com/NiLace> ;
+	foaf:mbox <mailto:nilace@nylarea.com> .
+
+<https://nylarea.com/nlsounds>
+	a doap:Project ;
+	doap:name "NL Sounds" ;
+	doap:license <http://opensource.org/licenses/GPL-3.0> ;
+	doap:maintainer <https://nylarea.com/nlsounds#me> ;
+	doap:developer <https://nylarea.com/nlsounds#me> .
+
+<https://nylarea.com/plugins/mk81>
+	a lv2:Plugin , lv2:DistortionPlugin ;
+	lv2:project <https://nylarea.com/nlsounds> ;
+	doap:name "MK 81" ;
+	lv2:minorVersion 2 ;
+	lv2:microVersion 0 ;
+	doap:license <http://opensource.org/licenses/GPL-3.0> ;
+	rdfs:comment "A British valve amp head of the 1980s, modelled from its circuit: 100 W or 50 W, EL34 or 6550." ;
+
+	lv2:optionalFeature lv2:hardRTCapable ;
+	ui:ui <https://nylarea.com/plugins/mk81#ui> ;
+	pg:mainInput <https://nylarea.com/plugins/mk81#in_group> ;
+	pg:mainOutput <https://nylarea.com/plugins/mk81#out_group> ;
+
+	lv2:port [
+		a lv2:AudioPort , lv2:InputPort ;
+		lv2:index 0 ;
+		lv2:symbol "in" ;
+		lv2:name "In" ;
+		rdfs:comment "Guitar input." ;
+		pg:group <https://nylarea.com/plugins/mk81#in_group>
+	] , [
+		a lv2:AudioPort , lv2:OutputPort ;
+		lv2:index 1 ;
+		lv2:symbol "out" ;
+		lv2:name "Out" ;
+		rdfs:comment "Amp output." ;
+		pg:group <https://nylarea.com/plugins/mk81#out_group>
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 2 ;
+		lv2:symbol "trim" ;
+		lv2:name "Output" ;
+		rdfs:comment "Output level after the amp: sets its loudness in the mix without changing its tone." ;
+		lv2:default 0.0 ;
+		lv2:minimum -24.0 ;
+		lv2:maximum 12.0 ;
+		units:unit units:db
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 3 ;
+		lv2:symbol "oversample" ;
+		lv2:name "Oversampling" ;
+		rdfs:comment "Internal oversampling of the amp model (fixed at 2x)." ;
+		lv2:default 2.0 ;
+		lv2:minimum 1.0 ;
+		lv2:maximum 4.0 ;
+		lv2:portProperty lv2:enumeration , lv2:integer ;
+		lv2:scalePoint [ rdfs:label "2x" ; rdf:value 2.0 ]
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 4 ;
+		lv2:symbol "preamp_vol" ;
+		lv2:name "Preamp Volume" ;
+		rdfs:comment "Preamp gain: from clean through crunch to full saturation." ;
+		lv2:default 0.7 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 5 ;
+		lv2:symbol "treble" ;
+		lv2:name "Treble" ;
+		rdfs:comment "High frequencies of the tone stack." ;
+		lv2:default 0.5 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 6 ;
+		lv2:symbol "middle" ;
+		lv2:name "Middle" ;
+		rdfs:comment "Midrange of the tone stack." ;
+		lv2:default 0.5 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 7 ;
+		lv2:symbol "bass" ;
+		lv2:name "Bass" ;
+		rdfs:comment "Low frequencies of the tone stack." ;
+		lv2:default 0.5 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0
+	] , [
+		a lv2:ControlPort , lv2:InputPort ;
+		lv2:index 8 ;
+		lv2:symbol "master" ;
+		lv2:name "Master Volume" ;
+		rdfs:comment "Power amp level: turn it up for the compression and sag of a cranked amp." ;
+		lv2:default 1.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0
+	] , [
+		a lv2:ControlPort , lv2:OutputPort ;
+		lv2:index 9 ;
+		lv2:symbol "latency" ;
+		lv2:name "Latency" ;
+		rdfs:comment "Latency the amp reports to the host, in samples." ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 4096.0 ;
+		lv2:portProperty lv2:reportsLatency , lv2:integer
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 10 ;
+		lv2:symbol "bias" ;
+		lv2:name "Bias" ;
+		lv2:default 0.5 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		rdfs:comment "Power valve bias: colder sounds tighter and thinner, hotter fuller and smoother." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 11 ;
+		lv2:symbol "us_spec" ;
+		lv2:name "US Spec (6550)" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "Fits 6550 power valves instead of EL34: tighter lows and more clean headroom." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 12 ;
+		lv2:symbol "low_input" ;
+		lv2:name "Low Input" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "The LOW input: less gain and a softer response than HIGH." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 13 ;
+		lv2:symbol "presence" ;
+		lv2:name "Presence" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		rdfs:comment "Adds bite and upper-midrange sparkle to the power amp's sound." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 14 ;
+		lv2:symbol "cab_load" ;
+		lv2:name "Cabinet Feel" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		rdfs:comment "From a flat test load to a real 4x12 speaker load, which shapes the lows and highs." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 15 ;
+		lv2:symbol "bypass" ;
+		lv2:name "Bypass" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "Passes the dry signal while the amp keeps running, for instant comparison." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 16 ;
+		lv2:symbol "power" ;
+		lv2:name "Power" ;
+		lv2:designation lv2:enabled ;
+		lv2:default 1.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "Switches the amp on or off." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 17 ;
+		lv2:symbol "hum" ;
+		lv2:name "Mains Hum" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		rdfs:comment "The mains hum of a real amp (1 = as loud as the original)." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 18 ;
+		lv2:symbol "hiss" ;
+		lv2:name "Hiss" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		rdfs:comment "The background hiss of a real amp (1 = as loud as the original)." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 19 ;
+		lv2:symbol "era" ;
+		lv2:name "Era (old way)" ;
+		lv2:default 1.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "The power supply of the early (1976) or late (1988) production." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 20 ;
+		lv2:symbol "head" ;
+		lv2:name "Head (100W / 50W)" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "100 W head with four power valves, or 50 W with two, which breaks up earlier." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 21 ;
+		lv2:symbol "bypass_preamp" ;
+		lv2:name "Preamp Bypass" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "Bypasses the preamp: the guitar goes straight into the power amp." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 22 ;
+		lv2:symbol "bypass_power" ;
+		lv2:name "Power Bypass" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "Bypasses the power amp: you hear the preamp alone." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 23 ;
+		lv2:symbol "fx_loop" ;
+		lv2:name "FX Loop" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:toggled ;
+		rdfs:comment "Switches on the effects loop between the preamp and the power amp." ;
+	] , [
+		a lv2:AudioPort , lv2:OutputPort ;
+		lv2:index 24 ;
+		lv2:symbol "fx_send" ;
+		lv2:name "FX Send" ;
+		rdfs:comment "Effects loop send: the preamp's signal, out to an external effect." ;
+	] , [
+		a lv2:AudioPort , lv2:InputPort ;
+		lv2:index 25 ;
+		lv2:symbol "fx_return" ;
+		lv2:name "FX Return" ;
+		rdfs:comment "Effects loop return: the effect's signal, back into the power amp." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 26 ;
+		lv2:symbol "fx_mix" ;
+		lv2:name "FX Mix" ;
+		lv2:default 100.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 100.0 ;
+		units:unit units:pc ;
+		rdfs:comment "How much of the effects return reaches the power amp: 100 % in series, less in parallel." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 27 ;
+		lv2:symbol "fx_return_lvl" ;
+		lv2:name "FX Return Level" ;
+		lv2:default 1.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 2.0 ;
+		rdfs:comment "Level of the effects return before it reaches the power amp." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 28 ;
+		lv2:symbol "engine" ;
+		lv2:name "Engine" ;
+		rdfs:comment "Internal engine selector (fixed)." ;
+		lv2:default 1.0 ;
+		lv2:minimum 1.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:integer , lv2:enumeration ;
+		lv2:scalePoint [ rdfs:label "Neural" ; rdf:value 1.0 ] ;
+	] .
+
+<https://nylarea.com/plugins/mk81#in_group>
+	a pg:InputGroup , pg:MonoGroup ;
+	lv2:symbol "main_in" ;
+	rdfs:label "Main input" .
+
+<https://nylarea.com/plugins/mk81#out_group>
+	a pg:OutputGroup , pg:MonoGroup ;
+	lv2:symbol "main_out" ;
+	rdfs:label "Main output" .

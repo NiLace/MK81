@@ -1,0 +1,16 @@
+@prefix lv2:  <http://lv2plug.in/ns/lv2core#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ui:   <http://lv2plug.in/ns/extensions/ui#> .
+@prefix opts: <http://lv2plug.in/ns/ext/options#> .
+
+<https://nylarea.com/plugins/mk81>
+	a lv2:Plugin ;
+	lv2:binary <mk81@LIB_EXT@> ;
+	rdfs:seeAlso <mk81.ttl> .
+
+<https://nylarea.com/plugins/mk81#ui>
+	a ui:X11UI ;
+	ui:binary <mk81_ui@LIB_EXT@> ;
+	lv2:optionalFeature opts:options ;
+	opts:supportedOption ui:scaleFactor ;
+	rdfs:seeAlso <mk81.ttl> .
