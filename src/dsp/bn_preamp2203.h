@@ -186,8 +186,8 @@ static inline void bn_preamp2203_pot_values(
     double out[BN_PREAMP2203_N_POTS], int us)
 {
     const double EPSR = 1.0;
-    const double VR3 = us ? 250e3 : 220e3;   /* treble */
-    const double VR4 = us ? 25e3  : 22e3;    /* middle */
+    const double VR3 = us ? 250000.0 : 220000.0;   /* treble (dsp/prototype/preamp.py) */
+    const double VR4 = us ? 25000.0 : 22000.0;    /* middle */
     const double v = bn_pot_log(vol), b = bn_pot_log(bass),
                  m = bn_pot_log_master(master);
     out[0] = 1e6   * (1.0 - v);    out[1] = 1e6   * v;        /* VR1 vol    */

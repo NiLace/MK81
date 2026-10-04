@@ -25,7 +25,7 @@
 	lv2:project <https://nylarea.com/nlsounds> ;
 	doap:name "MK 81" ;
 	lv2:minorVersion 2 ;
-	lv2:microVersion 0 ;
+	lv2:microVersion 2 ;
 	doap:license <http://opensource.org/licenses/GPL-3.0> ;
 	rdfs:comment "A British valve amp head of the 1980s, modelled from its circuit: 100 W or 50 W, EL34 or 6550." ;
 

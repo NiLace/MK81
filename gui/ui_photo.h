@@ -285,9 +285,10 @@ static void mk_knob_value(int side, int k, double v, int variant, char *out, int
     return;
   }
   switch (k) {
-    case 1: {                                                              /* Bias: mA per valve (mk81.ttl) */
-      int us = mk_variant_us(variant);
-      snprintf(out, n, "%.0f mA", us ? 42.0 + 50.0 * v : 25.0 + 30.0 * v); break; }
+    case 1:                  /* Bias: mA per valve, 25 / 40 / 55 for EVERY variant (the axis the nets were trained on,
+                              * harness/nn_datos.py BIAS_AXIS); the 6550's own 42..92 axis of July was never shipped */
+      (void)variant;
+      snprintf(out, n, "%.0f mA", 25.0 + 30.0 * v); break;
     case 3: {                                                              /* Return Level: 0..2 linear */
       double g = 2.0 * v;
       if (g < 1e-4) snprintf(out, n, "-inf dB"); else snprintf(out, n, "%+.1f dB", 20.0 * log10(g));

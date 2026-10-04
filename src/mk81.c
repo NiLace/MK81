@@ -569,8 +569,8 @@ static void bn_build_cfg(BritishNoise* self, int factor)
     self->tol_fine_on = 0; self->tol_env = 0.0;
     /* Persistent chord + explicit inverse, both ON in the product.
      * Persistent chord: the LU of the last factorisation survives across samples and the
-     * adaptive refresh (bn_dk_kernel.h, ratio 0,5) refactors only when an iteration fails to halve
-     * the residual. Explicit inverse: the inverse of Jg is built once per factorisation and
+     * adaptive refresh (`chord_refresh` in bn_dk.c: 0.3 since 24-Sep, 0.5 before) refactors only when an iteration
+     * fails to shrink the residual below that ratio of the previous one. Explicit inverse: the inverse of Jg is built once per factorisation and
      * every Newton step is an 8x8 matvec instead of the serial triangular solve. Measured on 6 s
      * of DI at os 2 (idle, four alternating cycles): 490-531 ms -> 364-381 (-26 % of the plugin);
      * against the engine at tol 1e-6 the preamp lands at -89,6 dB / -37,8 worst frame where the

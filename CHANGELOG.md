@@ -7,6 +7,12 @@ Versions follow the LV2 rules: the plugin's URI is the major version, so a relea
 
 ---
 
+## 1.2.2
+
+- The Bias readout on the back panel now shows the right idle current for the 6550 versions: 25, 40 and 55 mA per
+  valve from cold through factory to hot, as on the EL34 versions. 1.2.0 printed 42-92 mA there. The sound does not
+  change: only the number the panel shows.
+
 ## 1.2.0 — first public release
 
 - A British valve amplifier head of the early 1980s, modelled from its circuit, in four versions: 100 W or
