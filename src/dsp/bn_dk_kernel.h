@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_dk_kernel.h — TEMPLATE for a kernel specialised per circuit.
  *
  * Profiling put the cost in the overhead of small loops (indices, run-time

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_dk.c — nodal DK method in C. Port of the prototype dsp/prototype/dk.py.
  *
  * It is checked against the prototype sample by sample (dsp/prototype/

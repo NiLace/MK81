@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* ui_photo.h — MK 81 : the photoreal panel (front and back), a PURE drawing module: no window, no host.
  * ui.c drives it from Pugl; ui_preview.c renders it to a PNG without a host. ONE source for what is drawn and for
  * where a click lands (the click zones are the Blender scene's own projections, ui_photo_layout.h).

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_nn_lstm.c — see bn_nn_lstm.h. PyTorch LSTM (gate order i, f, g, o):
  *   i = s(W_ii x + b_ii + W_hi h + b_hi)   f = s(...)   g = tanh(...)   o = s(...)
  *   c' = f * c + i * g ;  h' = o * tanh(c')

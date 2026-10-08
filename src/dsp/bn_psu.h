@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_psu.h — the 100 W head's power supply at CONTROL RATE.
  *
  * Averaged ODE of the rectifier + filters, integrated at ~1 kHz. It reproduces

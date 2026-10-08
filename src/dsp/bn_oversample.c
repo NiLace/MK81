@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_oversample.c — the halfband chain in POLYPHASE form.
  *
  * The halfband (BN_HB_TAPS = 95, centre 47) decomposes as:

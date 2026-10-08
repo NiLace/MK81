@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_nn_lstm.h — the neural power stage of MK 81 as it ships: an LSTM
  * (PyTorch layout, gates i, f, g, o) on five inputs — w2, the rail factor, presence, bias,
  * cabinet feel — in the RAIL'S FRAME: y = r · net(w2 / r, r, knobs). The frame is the cascade's

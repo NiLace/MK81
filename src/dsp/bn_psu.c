@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_psu.c — see bn_psu.h. Semi-implicit integration (backward Euler by
  * chained substitution): stable with a control dt (1 ms) and 0.5 s taus. */
 #include <stdlib.h>   /* getenv/atof: experiment lever, see bn_psu_init */

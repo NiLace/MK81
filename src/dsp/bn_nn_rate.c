@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_nn_rate.c — see bn_nn_rate.h.
  *
  * Kernel: h(s) = 2fc sinc(2fc s) · w(s/L), s in samples of the kernel's spacing, fc in cycles per

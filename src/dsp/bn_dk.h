@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_dk.h — real-time circuit engine using the nodal DK method.
  *
  * Formulation: Holters & Zölzer, DAFx-11. Validated prototype in

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_fx_comp.c — see bn_fx_comp.h. */
 #include <math.h>
 #include <stdlib.h>

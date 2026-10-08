@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* ui.c — MK 81 : the LV2 UI (Pugl + Cairo), the photoreal panel (front and back).
  * The drawing and the click zones live in ui_photo.h (a pure module, also used by ui_preview.c); here: the Pugl
  * window, the events and the port writes.

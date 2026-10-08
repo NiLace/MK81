@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) The NL Sounds contributors
 """gen_nn_blob.py — embed the shipped neural power stages (nn/*.bnn2) in a C header so the
 plugin binds them with bn_nn_lstm_bind() at instantiate: no file I/O, no bundle path, RT-safe.
   python3 tools/gen_nn_blob.py build/mk81_gen/bn_nn_weights.h

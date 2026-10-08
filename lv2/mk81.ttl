@@ -16,7 +16,7 @@
 <https://nylarea.com/nlsounds>
 	a doap:Project ;
 	doap:name "NL Sounds" ;
-	doap:license <http://opensource.org/licenses/GPL-3.0> ;
+	doap:license <https://spdx.org/licenses/AGPL-3.0-only> ;
 	doap:maintainer <https://nylarea.com/nlsounds#me> ;
 	doap:developer <https://nylarea.com/nlsounds#me> .
 
@@ -26,7 +26,7 @@
 	doap:name "MK 81" ;
 	lv2:minorVersion 2 ;
 	lv2:microVersion 2 ;
-	doap:license <http://opensource.org/licenses/GPL-3.0> ;
+	doap:license <https://spdx.org/licenses/AGPL-3.0-only> ;
 	rdfs:comment "A British valve amp head of the 1980s, modelled from its circuit: 100 W or 50 W, EL34 or 6550." ;
 
 	lv2:optionalFeature lv2:hardRTCapable ;

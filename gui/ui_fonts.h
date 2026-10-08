@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* ui_fonts.h — loading of the bundled fonts (FreeType → cairo-ft) for the MK 81 panel.
  * The cairo faces are exposed in bn_face[]; if one failed to load (NULL), ui_photo.h falls back
  * to Cairo's "toy API" (system font). Role → file mapping in ui_fonts.c. */

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* mk81.c — LV2 plugin written against the bare API, no frameworks.
  *
  * The preamp of the 100 W head is solved with the DK method (netlist ->

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_oversample.h — a chain of halfband filters to oversample the nonlinear part.
  *
  * A halfband has half its coefficients exactly zero, so it costs half a generic FIR of the same

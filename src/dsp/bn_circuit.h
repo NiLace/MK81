@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_circuit.h — a circuit described as DATA.
  *
  * This is the piece that makes a multi-model plugin possible: an amp is a

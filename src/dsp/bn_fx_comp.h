@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_fx_comp.h — the FX loop's complementary path: what the host cannot carry comes back inside the plugin.
  *
  * The effects loop runs at the host's rate, so the part of the seam signal above the host's Nyquist never returns

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_nn_rate.h — runs the neural power stage at the rate it was trained at (96 kHz) inside a loop
  * that ticks at any fs_hi. A recurrent net's time constants are its sample period, so running it at
  * another rate is running another model: at fs_hi = 192 kHz it scores no better than the cascade.

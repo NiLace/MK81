@@ -130,7 +130,7 @@ make install      # installs it to ~/.lv2 (atomically: safe while a host has it 
 
 - **Pugl** (`deps/pugl/`) — the windowing library, by David Robillard, under the ISC licence.
 - **Fonts** (`gui/fonts/`) — Doto (© The Doto Project Authors) and Oswald, under the SIL Open Font License 1.1 (full
-  texts beside them). They stay under the OFL and are not relicensed under the GPL. They travel inside the bundle
+  texts beside them). They stay under the OFL and are not relicensed under the AGPL. They travel inside the bundle
   because the interface draws the model display, the live values and the help cards with them directly.
 - **Interface images** (`gui/photo/`) — renders of our own 3D scene of the amp, lit with the `studio_small_08` HDRI
   from [Poly Haven](https://polyhaven.com/a/studio_small_08) (CC0), with the Leather031, Fabric035 and Planks023B
@@ -147,7 +147,11 @@ the design, and the testing. I can read C, but I have not reviewed every line by
 - **Help is welcome.** If you read code, spot bugs, or want to improve it, review and contributions are genuinely
   appreciated — that's a big part of why it's open.
 
-Released under the **GNU General Public License v3.0 or later** — see [`LICENSE`](LICENSE).
+Released under the **GNU Affero General Public License v3.0, that version only** (`AGPL-3.0-only`) — see
+[`LICENSE`](LICENSE). You may use it, study it, modify it and sell it; what nobody may do is close it: any
+version you distribute, or let others use over a network, has to come with its complete source under this same
+licence. The third-party parts listed above keep their own licences. Contributions are welcome — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Author
 

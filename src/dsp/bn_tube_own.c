@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_tube_own.c — the project's own triode (12AX7). EXACT port of
  * dsp/prototype/tube_own.py: if the two disagree, the port is wrong
  * (tools/bn_test_tube_own.c checks this).

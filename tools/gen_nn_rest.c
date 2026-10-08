@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* gen_nn_rest.c — precompute each shipped arm's REST state and emit it as a header.
  *
  * WHY. Settling all four LSTM arms for 0.5 s each in `instantiate`, on every instantiation, costs

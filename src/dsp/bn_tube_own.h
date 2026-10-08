@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) The NL Sounds contributors */
 /* bn_tube_own.h — the project's OWN triode (12AX7, Dempwolf & Zölzer DAFx-11
  * form, parameters fitted by us to the RCA datasheet).
  *
