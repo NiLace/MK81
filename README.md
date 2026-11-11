@@ -64,6 +64,13 @@ differently under a hard-hit chord.
   published datasheet curves.
 - The arbiter throughout development was **ngspice** running the same netlist: not a listening test, and not a
   capture of somebody's unit.
+- **Why earlier versions used a neural network, and this one does not.** Up to 1.2.2 only the preamp was solved this
+  way. The power stage, the supply's sag and the speaker load were a small recurrent network per version, trained
+  against the exact circuit, because solving that part sample by sample then cost more CPU than a plugin should ask
+  for. Since then, the solver has become efficient enough to run the whole amplifier as a circuit for about the same
+  CPU. That brings the power stage under the same rule as the preamp. The power valves, the transformer, the feedback,
+  the sag and the cabinet's load now answer the schematic directly, at every knob setting and with every guitar,
+  because nothing is learnt from examples. So the whole amp is now a single model.
 
 The circuit runs at **2x internally** (4x with HQ, see below), so what the valves create does not fold back into the
 audible band. That costs **85 samples** of latency at every session rate (1.77 ms at 48 kHz), the same whether HQ is on
@@ -131,6 +138,34 @@ the jack. Your audio interface's input gain sets how hard the guitar hits the fi
 does on the real amp. A DI recorded with its peaks around −10 dBFS is a guitar played normally; a boost or overdrive in
 front takes it up to about 0 dBFS. There is no "ideal" level: a hotter input means more preamp distortion, as on the
 hardware.
+
+**Setting it in your DAW.** Turn the guitar's volume **full up** and play as hard as you ever will: strum, palm-mute,
+dig in. Set the interface's input gain so those peaks land at about **−6 dBFS** on the track's meter, and never above
+−1 dBFS (past that it is the interface that clips, not the amp). Leave the track's gain at 0 dB in front of MK 81 and
+don't normalise a recorded DI. The interface knob then stays put. Shape the gain the way you would on the amp: with
+Pre-Amp, the LOW input, and the guitar's volume knob, which cleans the amp up as it does on the hardware. For more
+drive, put a boost in front. This is a starting point, not a measurement: there is no calibrated guitar to read a
+voltage from.
+
+**How much it reacts.** The table shows how hard a held open A string (110 Hz) is distorted, at peak input levels
+from −36 dBFS to 0 dBFS. It was measured on the 100 W EL34 version, with Master full and the other controls at their
+defaults (1.4.0, 2x):
+
+| Pre-Amp | −36 dBFS | −30 | −24 | −18 | −12 | −6 | 0 dBFS |
+|---|---|---|---|---|---|---|---|
+| 30 % | 3 % | 5 % | 19 % | 31 % | 37 % | 40 % | 37 % |
+| 70 % (default) | 24 % | 34 % | 39 % | 40 % | 36 % | 33 % | 34 % |
+| full | 37 % | 40 % | 38 % | 34 % | 33 % | 35 % | 36 % |
+
+Around 35-40 % the amp is fully saturated. Past that point, more input buys compression and sustain rather than more
+distortion. The input level matters most with Pre-Amp low. At 30 %, the same 36 dB of input range goes from clean,
+through crunch, to saturation, and the output of a played DI rises 16 dB across it. At the default it rises 6 dB, and
+at full, 3 dB. That is the amp squeezing the dynamics as it saturates.
+
+**The Output knob.** Output is a plain volume control after the amp: it adds nothing to the sound and drives nothing.
+Once the amp saturates it plays close to full scale (peaks near 0 dBFS with the defaults). Use Output to match what
+the next plugin in the chain expects, usually a cabinet IR loader. If you don't know what that is, around −6 to −12
+dB leaves the next plugin some headroom.
 
 ## What it doesn't model
 
