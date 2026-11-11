@@ -10,10 +10,13 @@
  *
  * Controls -> ports (lv2/mk81.ttl; the indices are API, see lv2/frozen_symbols.txt):
  *   FRONT  Presence 13 · Bass 7 · Middle 6 · Treble 5 · Master 8 · Pre-Amp `preamp_vol` 4 · Output `trim` 2 (dB)
- *          Power rocker 16 · HIGH/LOW jacks `low_input` 12 · LED drop-down `head` 20 + `us_spec` 11
+ *          Power rocker 16 · HIGH/LOW jacks `low_input` 12 · LED drop-down `head` 20 + `us_spec` 11 ·
+ *          the HQ letters under the badge `hq` 29 (pressed = 1 = 4x; released = 0 = 2x, the default)
  *   BACK   Analog Noise `hum` 17 + `hiss` 18 (together) · Bias 10 · Cabinet Feel `cab_load` 14 ·
- *          Return Level `fx_return_lvl` 27 (0-2) · FX Mix `fx_mix` 26 (0-100 %)
- *          Full Bypass `bypass` 15 · Preamp Bypass 21 · Power Bypass 22 · Era 19 (UP = 1976 = 1) · FX Loop 23
+ *          Return Level `fx_return_lvl` 27 (0-2)
+ *          Full Bypass `bypass` 15 · Preamp Bypass 21 · Power Bypass 22 · Era 19 (UP = 1976 = 1) · FX Loop 23 ·
+ *          LEVEL `fx_level` 30 (UP = LINE = 0, DOWN = PEDAL = 1, the default)
+ *   `fx_mix` 26 is not drawn (the loop is series-only with the reissue card); the port stays for saved sessions.
  *   The grille cloth (front) and the vent (back) turn the head round; a click anywhere else does nothing.
  */
 #include <math.h>
@@ -24,6 +27,7 @@
 
 #include <pugl/pugl.h>
 #include <pugl/cairo.h>
+#include <X11/Xlib.h>
 #include <cairo/cairo.h>
 
 #include <lv2/atom/atom.h>
@@ -37,21 +41,28 @@
 
 #define MK_UI_URI "https://nylarea.com/plugins/mk81#ui"
 
+/* lv2:index of each port as the ULTRA bundle with the card ships it (tools/ttl_ultra.py --card appends `hq` 29 and
+ * `fx_level` 30) */
 enum { P_TRIM = 2, P_PREAMP_VOL = 4, P_TREBLE = 5, P_MIDDLE = 6, P_BASS = 7, P_MASTER = 8, P_BIAS = 10,
        P_US_SPEC = 11, P_LOW = 12, P_PRESENCE = 13, P_CAB_LOAD = 14, P_BYPASS = 15, P_POWER = 16, P_HUM = 17,
        P_HISS = 18, P_ERA = 19, P_HEAD = 20, P_BYPASS_PREAMP = 21, P_BYPASS_POWER = 22, P_FX_LOOP = 23,
-       P_FX_MIX = 26, P_FX_RETURN_LVL = 27 };
+       P_FX_RETURN_LVL = 27, P_HQ = 29, P_FX_LEVEL = 30 };
 
 /* a knob's port and its range; the knob holds 0..1 (frame 0 = the minimum), the port the real unit */
 typedef struct { int port, port2; double lo, hi, def; } MkKnobPort;
 static const MkKnobPort FRONT_PORT[MK_N_FRONT_KNOB] = {     /* panel order, left to right (pack_assets.py) */
-  { P_PRESENCE, -1, 0, 1, 0.0 }, { P_BASS, -1, 0, 1, 0.5 }, { P_MIDDLE, -1, 0, 1, 0.5 }, { P_TREBLE, -1, 0, 1, 0.5 },
-  { P_MASTER, -1, 0, 1, 1.0 }, { P_PREAMP_VOL, -1, 0, 1, 0.7 }, { P_TRIM, -1, -24, 12, 0.0 } };
+#define MK_KP(port, port2, sym) { port, port2, MK_LO_##sym, MK_HI_##sym, MK_DEF_##sym }   /* the TTL's range (ui_texts.h) */
+  MK_KP(P_PRESENCE, -1, presence), MK_KP(P_BASS, -1, bass), MK_KP(P_MIDDLE, -1, middle), MK_KP(P_TREBLE, -1, treble),
+  MK_KP(P_MASTER, -1, master), MK_KP(P_PREAMP_VOL, -1, preamp_vol), MK_KP(P_TRIM, -1, trim) };
 static const MkKnobPort BACK_PORT[MK_N_BACK_KNOB] = {
-  { P_HUM, P_HISS, 0, 1, 0.0 }, { P_BIAS, -1, 0, 1, 0.5 }, { P_CAB_LOAD, -1, 0, 1, 0.0 },
-  { P_FX_RETURN_LVL, -1, 0, 2, 1.0 }, { P_FX_MIX, -1, 0, 100, 100.0 } };
-static const int TOGGLE_PORT[MK_N_TOGGLE] = { P_BYPASS, P_BYPASS_PREAMP, P_BYPASS_POWER, P_ERA, P_FX_LOOP };
-static const int TOGGLE_DEF[MK_N_TOGGLE] = { 0, 0, 0, 1, 0 };
+  MK_KP(P_HUM, P_HISS, hum), MK_KP(P_BIAS, -1, bias), MK_KP(P_CAB_LOAD, -1, cab_load),
+  MK_KP(P_FX_RETURN_LVL, -1, fx_return_lvl) };
+static const int TOGGLE_PORT[MK_N_TOGGLE] = { P_BYPASS, P_BYPASS_PREAMP, P_BYPASS_POWER, P_ERA, P_FX_LOOP, P_FX_LEVEL };
+/* the bat's position (1 = UP) at the port's default; INV: the port is 1 with the bat DOWN (LEVEL: PEDAL is down) */
+static const int TOGGLE_DEF[MK_N_TOGGLE] = { (int)MK_DEF_bypass, (int)MK_DEF_bypass_preamp, (int)MK_DEF_bypass_power,
+                                              (int)MK_DEF_era, (int)MK_DEF_fx_loop, 1 - (int)MK_DEF_fx_level };   /* LEVEL: INV */
+static const int TOGGLE_INV[MK_N_TOGGLE] = { 0, 0, 0, 0, 0, 1 };
+static inline float toggle_port_val(int t, int up) { return (float)(TOGGLE_INV[t] ? !up : up); }
 
 static inline double to_norm(const MkKnobPort *k, double p) { return (p - k->lo) / (k->hi - k->lo); }
 static inline double to_port(const MkKnobPort *k, double v) { return k->lo + v * (k->hi - k->lo); }
@@ -82,7 +93,7 @@ typedef struct {
 
 static void redraw(MkUI *ui) { ui->needs_redraw = 1; }
 
-static void write_port(MkUI *ui, int port, float v) {
+static void write_port(MkUI *ui, int port, float v) {   /* port -1: none (MkKnobPort.port2) */
   if (port >= 0) ui->write(ui->controller, (uint32_t)port, sizeof(float), 0, &v);
 }
 
@@ -98,7 +109,7 @@ static double *knob_val(MkUI *ui, int hit, const MkKnobPort **kp) {
 
 static void set_knob(MkUI *ui, int hit, double v) {
   const MkKnobPort *kp; double *val = knob_val(ui, hit, &kp);
-  if (!val) return;
+  if (!val || !isfinite(v)) return;
   v = v < 0 ? 0 : v > 1 ? 1 : v;
   if (v == *val) return;
   *val = v;
@@ -125,15 +136,18 @@ static void build_tip(MkUI *ui, int h) {
     mk_knob_value(MK_BACK, k, st->back[k], st->variant, val, sizeof val);
   } else if (h >= MK_HIT_TOGGLE && h < MK_HIT_TOGGLE + MK_N_TOGGLE) {
     int k = h - MK_HIT_TOGGLE; t = mk_text(TOGGLE_PORT[k]);
-    if (TOGGLE_PORT[k] == P_ERA) snprintf(val, sizeof val, "%s", st->toggle[k] ? "1976" : "1988");
+    if (mk_toggle_inert(st, k)) snprintf(val, sizeof val, "%s", st->variant == 4 ? "No effect on the reissue" : "No effect on the 50 W head");
+    else if (TOGGLE_PORT[k] == P_ERA) snprintf(val, sizeof val, "%s", st->toggle[k] ? "1976" : "1988");
+    else if (TOGGLE_PORT[k] == P_FX_LEVEL) snprintf(val, sizeof val, "%s", st->toggle[k] ? "Line" : "Pedal");
     else snprintf(val, sizeof val, "%s", st->toggle[k] ? "On" : "Off");
   } else switch (h) {
     case MK_HIT_ROCKER:    t = mk_text(P_POWER); snprintf(val, sizeof val, "%s", st->power ? "On" : "Off"); break;
+    case MK_HIT_HQ:        t = mk_text(P_HQ); snprintf(val, sizeof val, "%s", st->hq ? "On: 4x" : "Off: 2x"); break;
     case MK_HIT_JACK_HIGH:
     case MK_HIT_JACK_LOW:  title = "Input"; line = "Plug into HIGH for full gain, or LOW for less gain and a softer response.";
                            snprintf(val, sizeof val, "Cable in %s", st->low ? "LOW" : "HIGH"); break;
-    case MK_HIT_LED:       title = "Model"; line = "Picks the head (100 W or 50 W) and the power valves (EL34 or 6550).";
-                           snprintf(val, sizeof val, "%s", MK_VARIANT_NAME[st->variant & 3]); break;
+    case MK_HIT_LED:       title = "Model"; line = "Picks the head (100 W, 50 W or the 100 W reissue) and the power valves (EL34 or 6550).";
+                           snprintf(val, sizeof val, "%s", MK_VARIANT_NAME[(unsigned)st->variant % MK_N_VARIANT]); break;
     case MK_HIT_FLIP:      title = st->side == MK_FRONT ? "Back panel" : "Front panel";
                            line = st->side == MK_FRONT ? "Click to turn the amp round and see its back panel."
                                                        : "Click to turn the amp back to its front panel."; break;
@@ -153,14 +167,17 @@ static void to_asset(MkUI *ui, double wx, double wy, double *ax, double *ay) {
 }
 
 static void on_press(MkUI *ui, double x, double y, double wy, int button) {
-  if (button != 0) return;                                 /* Pugl numbers buttons from 0: the left one */
+  if (button != 0) {                                       /* Pugl numbers buttons from 0: the left one */
+    if (ui->st.menu_open) { ui->st.menu_open = 0; ui->st.menu_hover = -1; redraw(ui); }   /* another button closes the list */
+    return;
+  }
   double now = puglGetTime(ui->world);
   hide_tip(ui);
   int h = mk_hit(&ui->st, x, y);
   MkState *st = &ui->st;
   if (st->menu_open) {                                       /* any click closes the list; a row picks a variant */
     st->menu_open = 0; st->menu_hover = -1;
-    if (h >= MK_HIT_MENU && h < MK_HIT_MENU + 4) {
+    if (h >= MK_HIT_MENU && h < MK_HIT_MENU + MK_N_VARIANT) {
       st->variant = h - MK_HIT_MENU;
       write_port(ui, P_HEAD, (float)mk_variant_head(st->variant));
       write_port(ui, P_US_SPEC, (float)mk_variant_us(st->variant));
@@ -169,7 +186,7 @@ static void on_press(MkUI *ui, double x, double y, double wy, int button) {
   }
   const MkKnobPort *kp; double *val = knob_val(ui, h, &kp);
   if (val) {
-    if (h == ui->last_press_hit && now - ui->last_press_t < 0.35) {   /* double click: back to the port's default */
+    if (h == ui->last_press_hit && now - ui->last_press_t < 0.35) {   /* double click (0.35 s): back to the port's default */
       set_knob(ui, h, to_norm(kp, kp->def)); ui->last_press_t = 0; return;
     }
     ui->last_press_hit = h; ui->last_press_t = now;
@@ -179,13 +196,16 @@ static void on_press(MkUI *ui, double x, double y, double wy, int button) {
   }
   ui->last_press_hit = h; ui->last_press_t = now;
   if (h >= MK_HIT_TOGGLE && h < MK_HIT_TOGGLE + MK_N_TOGGLE) {
-    int t = h - MK_HIT_TOGGLE; st->toggle[t] = !st->toggle[t];
-    write_port(ui, TOGGLE_PORT[t], (float)st->toggle[t]);
+    int t = h - MK_HIT_TOGGLE;
+    if (mk_toggle_inert(st, t)) { redraw(ui); return; }    /* Era on the 50 W head and the reissue: drawn centred, nothing to switch */
+    st->toggle[t] = !st->toggle[t];
+    write_port(ui, TOGGLE_PORT[t], toggle_port_val(t, st->toggle[t]));
     if (TOGGLE_PORT[t] == P_BYPASS) st->bypass = st->toggle[t];
     redraw(ui); return;
   }
   switch (h) {
     case MK_HIT_ROCKER:    st->power = !st->power; write_port(ui, P_POWER, (float)st->power); break;
+    case MK_HIT_HQ:        st->hq = !st->hq; write_port(ui, P_HQ, (float)st->hq); break;   /* the HQ letters */
     case MK_HIT_JACK_HIGH: if (st->low)  { st->low = 0; write_port(ui, P_LOW, 0.0f); } break;
     case MK_HIT_JACK_LOW:  if (!st->low) { st->low = 1; write_port(ui, P_LOW, 1.0f); } break;
     case MK_HIT_LED:       st->menu_open = 1; st->menu_hover = -1; break;
@@ -208,8 +228,8 @@ static void on_motion(MkUI *ui, double x, double y, double wy, int fine) {
     ui->show_val_t = puglGetTime(ui->world);
     return;
   }
+  const int h = mk_hit(st, x, y);                            /* one hit test for the card and the list */
   {                                                          /* the help card: rest on a control to see it */
-    int h = mk_hit(st, x, y);
     if (st->tip && (h != ui->hover_hit || hypot(x - st->tip_x, y - st->tip_y) > 8.0)) hide_tip(ui);
     ui->hover_hit = h; ui->last_move_t = puglGetTime(ui->world);
     if (!st->tip) { st->tip_x = x; st->tip_y = y; }
@@ -218,7 +238,7 @@ static void on_motion(MkUI *ui, double x, double y, double wy, int fine) {
   int hov = mk_in_box(x, y, &MK_LED_BEZEL);
   if (hov != st->led_hover) { st->led_hover = hov; if (!st->power) redraw(ui); }
   if (st->menu_open) {
-    int h = mk_hit(st, x, y), r = (h >= MK_HIT_MENU && h < MK_HIT_MENU + 4) ? h - MK_HIT_MENU : -1;
+    const int r = (h >= MK_HIT_MENU && h < MK_HIT_MENU + MK_N_VARIANT) ? h - MK_HIT_MENU : -1;
     if (r != st->menu_hover) { st->menu_hover = r; redraw(ui); }
   }
 }
@@ -248,6 +268,7 @@ static PuglStatus on_event(PuglView *view, const PuglEvent *e) {
     case PUGL_BUTTON_PRESS:
       to_asset(ui, e->button.x, e->button.y, &ax, &ay); on_press(ui, ax, ay, e->button.y, (int)e->button.button); break;
     case PUGL_BUTTON_RELEASE:
+      if (e->button.button != 0) break;                    /* only the left button ends a drag */
       if (ui->drag >= 0) ui->show_val_t = puglGetTime(ui->world);   /* the value lingers 1 s, then the name returns */
       ui->drag = -1; break;
     case PUGL_MOTION:
@@ -274,6 +295,7 @@ static void defaults(MkUI *ui) {
   for (int k = 0; k < MK_N_BACK_KNOB; k++) st->back[k] = to_norm(&BACK_PORT[k], BACK_PORT[k].def);
   for (int t = 0; t < MK_N_TOGGLE; t++) st->toggle[t] = TOGGLE_DEF[t];
   st->power = 1; st->rocker = 1.0; st->bypass = 0; st->low = 0; st->variant = 0; st->side = MK_FRONT;
+  st->hq = 0;                                               /* the product's default: 2x */
   st->menu_hover = -1; st->show_val = -1; st->tip = 0;
   ui->hover_hit = MK_HIT_NONE;
 }
@@ -310,7 +332,7 @@ static LV2UI_Handle instantiate(const LV2UI_Descriptor *d, const char *uri, cons
     for (const LV2_Options_Option *o = opts; o->key; o++)
       if (o->key == k && o->type == tf && o->value) sf = *(const float *)o->value;
   }
-  if (!(sf >= 0.5 && sf <= 4.0)) sf = 1.0;
+  if (!(sf >= 0.5 && sf <= 4.0)) sf = 1.0;                  /* outside 0.5..4 (or NaN) is a host bug: 1 */
   int dw = (int)lround(MK_LOGICAL_W * sf), dh = (int)lround(MK_LOGICAL_H * sf);
   ui->world = puglNewWorld(PUGL_MODULE, 0);
   if (!ui->world) { mk_assets_free(&ui->A); if (ui->fonts_loaded) bn_fonts_free(); free(ui); return NULL; }
@@ -338,8 +360,21 @@ static LV2UI_Handle instantiate(const LV2UI_Descriptor *d, const char *uri, cons
   return ui;
 }
 
+/* Process what the X server already knows before touching our window: a host may destroy the parent (and with it our
+ * child window) before it calls cleanup() or resizes us. XSync makes the server's DestroyNotify reach this connection,
+ * and one Pugl pass reads it, after which Pugl knows the window is gone and makes no X request on it (an X error on a
+ * dead window reaches Xlib's default handler, which exits the host). Returns 0 when our window no longer exists. */
+static int mk_window_alive(MkUI *ui) {
+  if (!ui->world || !ui->view) return 0;
+  Display *d = (Display *)puglGetNativeWorld(ui->world);
+  if (d) XSync(d, False);
+  puglUpdate(ui->world, 0.0);
+  return puglGetNativeView(ui->view) != 0;
+}
+
 static void cleanup(LV2UI_Handle h) {
   MkUI *ui = (MkUI *)h;
+  (void)mk_window_alive(ui);
   if (ui->view) puglFreeView(ui->view);
   if (ui->world) puglFreeWorld(ui->world);
   mk_assets_free(&ui->A);
@@ -349,8 +384,9 @@ static void cleanup(LV2UI_Handle h) {
 
 static void port_event(LV2UI_Handle h, uint32_t port, uint32_t size, uint32_t format, const void *buf) {
   MkUI *ui = (MkUI *)h;
-  if (format != 0 || size != sizeof(float)) return;
+  if (format != 0 || size != sizeof(float)) return;          /* format 0: a plain float control; nothing else is ours */
   float p = *(const float *)buf;
+  if (!isfinite(p)) return;   /* a non-finite value from the host: keep what is drawn, never echo it back on a drag */
   MkState *st = &ui->st;
   for (int k = 0; k < MK_N_FRONT_KNOB; k++)
     if (FRONT_PORT[k].port == (int)port) {
@@ -375,8 +411,8 @@ static void port_event(LV2UI_Handle h, uint32_t port, uint32_t size, uint32_t fo
     }
   for (int t = 0; t < MK_N_TOGGLE; t++)
     if (TOGGLE_PORT[t] == (int)port) {
-      int v = p > 0.5f;
-      if (v != st->toggle[t]) { st->toggle[t] = v; redraw(ui); }
+      int v = p > 0.5f, up = TOGGLE_INV[t] ? !v : v;
+      if (up != st->toggle[t]) { st->toggle[t] = up; redraw(ui); }
       if (port == P_BYPASS && v != st->bypass) { st->bypass = v; redraw(ui); }
       return;
     }
@@ -384,7 +420,9 @@ static void port_event(LV2UI_Handle h, uint32_t port, uint32_t size, uint32_t fo
   switch ((int)port) {
     case P_POWER:   if (v != st->power) { st->power = v; redraw(ui); } break;
     case P_LOW:     if (v != st->low)   { st->low = v;   redraw(ui); } break;
-    case P_HEAD:    { int nv = mk_variant_of(v, mk_variant_us(st->variant));
+    case P_HQ:      if (v != st->hq)    { st->hq = v;    redraw(ui); } break;
+    case P_HEAD:    { const int hv = p > 1.5f ? 2 : p > 0.5f ? 1 : 0;   /* 0 / 1 / 2 = 100 W, 50 W, the reissue */
+                      int nv = mk_variant_of(hv, mk_variant_us(st->variant));
                       if (nv != st->variant) { st->variant = nv; redraw(ui); } break; }
     case P_US_SPEC: { int nv = mk_variant_of(mk_variant_head(st->variant), v);
                       if (nv != st->variant) { st->variant = nv; redraw(ui); } break; }
@@ -412,8 +450,8 @@ static int ui_idle(LV2UI_Handle h) {
     build_tip(ui, ui->hover_hit);
     if (ui->st.tip_title[0]) { ui->st.tip = 1; redraw(ui); }
   }
-  /* FRAME-RATE CAP: 30 fps is plenty for a knob drag; needs_redraw stays set, so
-   * nothing is lost — it is only coalesced */
+  /* FRAME-RATE CAP: 30 fps is plenty for a knob drag. A redraw asked for inside the cap is not lost: needs_redraw stays
+   * set until the next idle that paints */
   if (ui->needs_redraw && (now - ui->last_paint) >= (1.0 / 30.0)) {
     ui->needs_redraw = 0; ui->last_paint = now;
     puglObscureView(ui->view);
@@ -427,6 +465,7 @@ static int ui_idle(LV2UI_Handle h) {
 static int ui_resize_cb(LV2UI_Feature_Handle handle, int width, int height) {
   MkUI *ui = (MkUI *)handle;
   if (width < 1 || height < 1) return 1;
+  if (!mk_window_alive(ui)) return 1;                      /* the host destroyed our window: nothing to resize */
   /* resize the VIEW: PUGL_CONFIGURE then sets win_w/h from the real window (setting them here alone would draw
    * and hit-test for a size the X window does not have) */
   puglSetSizeHint(ui->view, PUGL_CURRENT_SIZE, (PuglSpan)width, (PuglSpan)height);

@@ -11,6 +11,7 @@
 <https://nylarea.com/plugins/mk81#ui>
 	a ui:X11UI ;
 	ui:binary <mk81_ui@LIB_EXT@> ;
-	lv2:optionalFeature opts:options ;
+	lv2:optionalFeature opts:options , ui:idleInterface ;
+	lv2:extensionData ui:idleInterface , ui:resize ;
 	opts:supportedOption ui:scaleFactor ;
 	rdfs:seeAlso <mk81.ttl> .

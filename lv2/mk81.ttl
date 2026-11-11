@@ -24,8 +24,8 @@
 	a lv2:Plugin , lv2:DistortionPlugin ;
 	lv2:project <https://nylarea.com/nlsounds> ;
 	doap:name "MK 81" ;
-	lv2:minorVersion 2 ;
-	lv2:microVersion 2 ;
+	lv2:minorVersion 4 ;
+	lv2:microVersion 0 ;
 	doap:license <https://spdx.org/licenses/AGPL-3.0-only> ;
 	rdfs:comment "A British valve amp head of the 1980s, modelled from its circuit: 100 W or 50 W, EL34 or 6550." ;
 
@@ -63,7 +63,7 @@
 		lv2:index 3 ;
 		lv2:symbol "oversample" ;
 		lv2:name "Oversampling" ;
-		rdfs:comment "Internal oversampling of the amp model (fixed at 2x)." ;
+		rdfs:comment "Kept for older sessions and ignored: the oversampling is set by HQ (2x or 4x)." ;
 		lv2:default 2.0 ;
 		lv2:minimum 1.0 ;
 		lv2:maximum 4.0 ;
@@ -223,12 +223,13 @@
 		a lv2:InputPort , lv2:ControlPort ;
 		lv2:index 20 ;
 		lv2:symbol "head" ;
-		lv2:name "Head (100W / 50W)" ;
+		lv2:name "Head (100W / 50W / 100W RI)" ;
 		lv2:default 0.0 ;
 		lv2:minimum 0.0 ;
-		lv2:maximum 1.0 ;
-		lv2:portProperty lv2:toggled ;
-		rdfs:comment "100 W head with four power valves, or 50 W with two, which breaks up earlier." ;
+		lv2:maximum 2.0 ;
+		lv2:portProperty lv2:integer , lv2:enumeration ;
+		lv2:scalePoint [ rdfs:label "100W" ; rdf:value 0.0 ] , [ rdfs:label "50W" ; rdf:value 1.0 ] , [ rdfs:label "100W RI" ; rdf:value 2.0 ] ;
+		rdfs:comment "100 W head with four power valves, 50 W with two (breaks up earlier), or the 100 W reissue." ;
 	] , [
 		a lv2:InputPort , lv2:ControlPort ;
 		lv2:index 21 ;
@@ -280,7 +281,7 @@
 		lv2:minimum 0.0 ;
 		lv2:maximum 100.0 ;
 		units:unit units:pc ;
-		rdfs:comment "How much of the effects return reaches the power amp: 100 % in series, less in parallel." ;
+		rdfs:comment "Ignored: the effects loop is series only. Kept so saved sessions load." ;
 	] , [
 		a lv2:InputPort , lv2:ControlPort ;
 		lv2:index 27 ;
@@ -295,12 +296,34 @@
 		lv2:index 28 ;
 		lv2:symbol "engine" ;
 		lv2:name "Engine" ;
-		rdfs:comment "Internal engine selector (fixed)." ;
-		lv2:default 1.0 ;
+		rdfs:comment "The amp's engine (fixed: the whole amp solved as one circuit). Kept so saved sessions load." ;
+		lv2:default 2.0 ;
 		lv2:minimum 1.0 ;
-		lv2:maximum 1.0 ;
+		lv2:maximum 2.0 ;
 		lv2:portProperty lv2:integer , lv2:enumeration ;
-		lv2:scalePoint [ rdfs:label "Neural" ; rdf:value 1.0 ] ;
+		lv2:scalePoint [ rdfs:label "Ultra" ; rdf:value 2.0 ] ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 29 ;
+		lv2:symbol "hq" ;
+		lv2:name "High Quality" ;
+		lv2:default 0.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:integer , lv2:toggled ;
+		lv2:scalePoint [ rdfs:label "2x" ; rdf:value 0.0 ] , [ rdfs:label "4x" ; rdf:value 1.0 ] ;
+		rdfs:comment "High quality: the Ultra engine at 4x oversampling (off = 2x, the default), about 1.5-1.7 times the CPU." ;
+	] , [
+		a lv2:InputPort , lv2:ControlPort ;
+		lv2:index 30 ;
+		lv2:symbol "fx_level" ;
+		lv2:name "FX Loop Level" ;
+		lv2:default 1.0 ;
+		lv2:minimum 0.0 ;
+		lv2:maximum 1.0 ;
+		lv2:portProperty lv2:integer , lv2:toggled ;
+		lv2:scalePoint [ rdfs:label "Line" ; rdf:value 0.0 ] , [ rdfs:label "Pedal" ; rdf:value 1.0 ] ;
+		rdfs:comment "FX loop level: Line = hot send (about a third of the master signal), Pedal = guitar-level send." ;
 	] .
 
 <https://nylarea.com/plugins/mk81#in_group>

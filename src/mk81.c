@@ -2,12 +2,16 @@
 /* Copyright (C) The NL Sounds contributors */
 /* mk81.c — LV2 plugin written against the bare API, no frameworks.
  *
- * The preamp of the 100 W head is solved with the DK method (netlist ->
- * discretisation -> C -> LV2), and the power stage is a neural LSTM.
+ * The whole amp (preamp, phase inverter, power stage, output transformer and
+ * speaker load) is one nodal system solved at the oversampled rate (ULTRA,
+ * src/ultra/); the supply around it, the w2 seam (bypasses, FX loop), the
+ * hum, the hiss and the output trim live here.
  *
  * Audio-path rules: no memory allocation, no system calls, no denormals.
- * Everything expensive (building and solving the nodal system, allocating
- * buffers) happens in instantiate.
+ * Allocation happens in instantiate. The engine's DC solves (a start) run in
+ * activate(), and in run() once per switch: a factor change before the
+ * oversampled loop, a variant change or the effects card's start at the
+ * sample where its fade reaches zero.
  */
 #include <math.h>
 #include <stdint.h>
@@ -16,135 +20,74 @@
 
 #include <lv2/core/lv2.h>
 
-#include "bn_dk.h"
 #include "bn_oversample.h"
-#include "bn_tube_own.h"
-#include "bn_preamp2203.h"
 #include "bn_psu.h"
 #if defined(__SSE2__) || defined(_M_X64)
 #include <immintrin.h>
 #define BN_HAVE_MXCSR 1
 #endif
-#include "bn_nn_lstm.h"       /* the neural power stage */
-#include "bn_nn_rest.h"       /* each arm's settled rest state, precomputed (see below) */
-#include "bn_nn_rate.h"       /* the net runs at its training rate at any fs_hi */
 #include "bn_fx_comp.h"       /* the FX loop's complementary path */
-#include "bn_nn_weights.h"    /* generated: the four shipped weight sets, embedded */
 
+/* Measurement build only (-DBN_CENSUS): reference cycles (rdtsc) spent in each component of the run, printed at
+ * unload. Read as ratios: rdtsc counts reference cycles. */
+#define CZ_T0(v) ((void)0)
+#define CZ_ADD(acc, v) ((void)0)
+#include "bn_fx_pair.h"       /* the FX loop's resampler pair */
+#include "bn_ultra.h"         /* ULTRA: the whole amp on the nodal engine */
+#include "bn_ultra_bias.h"    /* its bias-reservoir law (generated table) */
+#include "prepig/bn_prepig.h" /* the send system the preamp bypass runs (preamp + phase inverter) */
+#include "bn_card.h"          /* the reissue effects card's state hand-over (the loop ON / OFF) */
+#ifndef BN_CARD_XF
+#define BN_CARD_XF 0.00125   /* s: the loop ON / OFF crossfade, raised cosine. Short because both engines run during it;
+                              * against 5 ms it adds no energy above 6 kHz */
+#endif
+#include "ret_nodal_api.h"    /* the card's return half on nlcore's nodal solver */
+#define CARD_RET_TICK(r, j) cr_ret_tick((r), (j))
+#ifdef BN_SEND_TWIN
+#ifndef BN_SEND_K
+#define BN_SEND_K(fi) 1   /* sub-steps per engine sample: 1, the engine's own rate (the twin's nodal Newton, not
+                           * sub-stepping, is what makes its send right) */
+#endif
+#include "send_nodal_api.h"   /* the card's send half alone, the send TWIN (see the card block in run()) */
+#endif
 
 
 
 #define BN_URI "https://nylarea.com/plugins/mk81"
 
-/* The FULL preamp saturates with ~60 V peaks at the master wiper (measured):
- * this compensates so the ceiling sits near 0 dBFS and the Output knob is a
- * fine trim, not a rescue. */
+/* Level conventions. The preamp saturates with ~60 V peaks at the master wiper (w2): the FX send, the return and
+ * the preamp-bypass input use 1.0 = 60 V there. The power stage clips with ~53 V peaks at the 8 ohm tap: the
+ * output is divided by it, so the ceiling sits near 0 dBFS and the Output knob is a trim, not a rescue. */
 #define BN_STAGE_GAIN 60.0
-/* The neural power stage's input guard. The nets were trained on the
- * preamp's w2, which the preamp's own saturation bounds at |w2| <= 57,8 V; the FX-loop return is the only input
- * with no such bound (1,0 FS x fx_return_lvl 2 x BN_STAGE_GAIN = 120 V), and outside its training range an LSTM
- * does not saturate like the circuit (measured: at +6 dB of return the LSTM-32 already played 1,5 dB louder than the
- * cascade with 1,51 peaks; at 120 V, 1,5-1,8x louder). This is the recovery triode's grid of a real loop: identity
- * up to BN_NN_GUARD_KNEE, then a tanh approach to BN_NN_GUARD_LIM, the trained maximum. It touches nothing the
- * preamp can produce (the reference DI peaks at 50,4 V); the FX send and the power bypass carry the unguarded w2. */
-#define BN_NN_GUARD_KNEE 54.0
-#define BN_NN_GUARD_LIM  58.0
-/* A net trained on w2x (the preamp fed the exact node X; `xlive` arms) saw a lower maximum,
- * because the preamp sags: 56,27 V over the 100 W UK head's 132 sets (57,78 on w2). Its guard ends at ITS trained maximum,
- * with the same 4 V knee span; still above everything the preamp produces on the reference DI (50,4 V). */
-#define BN_NN_GUARD_LIM_XLIVE  56.27
-#define BN_NN_GUARD_KNEE_XLIVE (BN_NN_GUARD_LIM_XLIVE - (BN_NN_GUARD_LIM - BN_NN_GUARD_KNEE))
-static inline double bn_nn_guard(double x, int xlive)
-{
-    const double knee = xlive ? BN_NN_GUARD_KNEE_XLIVE : BN_NN_GUARD_KNEE;
-    const double lim  = xlive ? BN_NN_GUARD_LIM_XLIVE  : BN_NN_GUARD_LIM;
-    const double ax = fabs(x);
-    if (ax <= knee) { return x; }
-    const double span = lim - knee;
-    const double y = knee + span * tanh((ax - knee) / span);
-    return x < 0.0 ? -y : y;
-}
-/* The power stage clips with ~53 V peaks at the 8 ohm tap (measured on the exact full amp): the output is
- * normalised to it, the same ceiling philosophy as BN_STAGE_GAIN. */
 #define BN_POWER_GAIN 53.0
 
-/* DC blocker: the corner, ANCHORED to a frequency.
- * It is expressed as "the pole A_REF at the rate FS_REF" instead of as an fc in
- * hertz, and that is deliberate: FS_REF = 96 kHz is exactly the fs_hi of the
- * factory configuration (2x on a 48k host), where the pole is the literal
- * 0.9995. So the shipped case is reproduced BYTE for BYTE and the other rates
- * are derived from it. The implied fc is
- *     fc = -ln(0.9995) * 96000 / (2*pi) = 7.6403 Hz */
-#define BN_DCBLOCK_A_REF  0.9995
-#define BN_DCBLOCK_FS_REF 96000.0
-/* Blocker of the w2 SEAM (FX loop send and the power bypass's dry path).
- * SUB-HERTZ corner on purpose: w2 rests at ~1e-9 V (the wiper hangs after the
- * coupling capacitor), so there is no DC to remove here, only the guarantee
- * that an audio port never carries it. With the output blocker's corner
- * (7,64 Hz) the send rotated 2 degrees at 220 Hz and a loop closed through a
- * TRANSPARENT effect gave the amp back only -29 dB from the original
- * (measured; the whole residual lived below 1 kHz). At 0,05 Hz the phase at
- * low E (82 Hz) is 0,035 degrees: -64 dB, below the -60 dB porting bar. */
+/* Blocker of the w2 SEAM (FX send and the power bypass's dry path). SUB-HERTZ on purpose: w2 rests at ~0 V (the
+ * wiper hangs after the coupling capacitor), so it only guarantees an audio port never carries DC. A 7.6 Hz corner
+ * rotated the send enough that a loop through a transparent effect came back only 29 dB below the original; at
+ * 0.05 Hz the phase at low E (82 Hz) is 0.035 degrees, a -64 dB residual. */
 #define BN_SEAM_HP_HZ 0.05
 
 #define BN_PI           3.14159265358979323846
 
-/* Thresholds of the silence bypass (the quiet freeze).
- * These absolute constants are the fallback: by default the thresholds are TIED
- * to `dk.tol` (see the quiet block in run()), and the freeze is taken on the
- * AVERAGED state, because what spoiled it was the Newton's jitter.
- * `BN_QUIET=0` restores the absolute constants below, so the before and after
- * can be measured on the same machine.
- * MOVEMENT: how much the output may move from sample to sample and still count
- * as still. 1e-9 (-180 dBFS) does not work: measured, with a zero input the
- * output keeps trembling ~7.4e-9 indefinitely — numerical noise of the solver,
- * not signal — so the bypass would never engage. 1e-7 is -140 dBFS: below the
- * floor of a 24-bit converter (-144 dBFS) and of anything audible.
- * ⚠️ That 7.4e-9 figure no longer describes the engine: with the absolute
- * constants the measured rest floor is max|y| = 3.97e-7 (-128 dBFS) with a
- * sample-to-sample max|dy| = 2.90e-7, ~40x ABOVE this 1e-7 threshold. Its cause
- * is NOT rounding: the FFT of the rest state shows a sustained LIMIT CYCLE at
- * 3265,75 Hz + a 3rd harmonic at 9797,25 Hz that does not decay.
- * MEASURED with the thresholds tied to tol (tolerance 3e-5): the bypass engages
- * on 53,9 % of a silent run at os 2 (factory) and os 4, floor -109,6 / -111,6
- * dBFS; a stopped track drops from 3,84 % of a core to 1,57 % (-57 %) and an
- * 8-track session with one track playing goes from 33,3 % to 17,2 %. ANMR of
- * the freeze -31,33 dB, 21,33 dB of margin.
- * ⛔ At os 1 it does NOT engage: the `0,116 x tol` rule holds from os >= 2 up,
- * and the os 1 floor has a cause of its own, still open.
- * ⛔ Raising EPS is NOT a fix (measured: with loose thresholds the note after
- * the silence moved to -63 dB).
- * LEVEL: the output must also BE in the tail (|y| < 1e-5, -100 dBFS), so the
- * engine never freezes on something that only looks flat. */
-#ifndef BN_QUIET_EPS
-#define BN_QUIET_EPS   1e-7
-#endif
-#ifndef BN_QUIET_LEVEL
-#define BN_QUIET_LEVEL 1e-5
-#endif
-/* STATE: watching the output is NOT enough. Measured: with the output already
- * at -140 dBFS the circuit is still recovering inside (the coupling capacitors
- * recharge to hundreds of volts and that barely shows at the output, between
- * the gain staging and the DC blocker). Freezing on the output alone, the note
- * that came AFTER 30 s of silence came out -82.8 dB different. So the DK state
- * itself must also be still, in terms RELATIVE to its magnitude. */
-/* The factor of the STATE threshold, relative to dk.tol. The only thing it decides is the bypass's
- * ENGAGE TIME: the stricter it is, the longer the circuit state takes to drop below it.
- * MEASURED SWEEP (20 s of zeros for engaging; ANMR of the freeze against the same build without it):
- *     0,1 -> 7,98 s to engage · ANMR -45,97 dB     (calibrated to tol 1e-4)
- *   ⭐0,3 -> 4,50 s           · ANMR -25,01 dB     <- CHOSEN: -44 % engage time, 15 dB of margin
- *     1,0 -> 1,10 s           · ANMR -11,34 dB     ⛔ passes by only 1,34 dB: a threshold AT THE EDGE gives no warning
- *     3,0 -> same as 1,0 (saturates)
- * ⇒ It matters when the transport stops and starts often (while mixing): 3,5 s less of full-load engine
- * PER STOPPED TRACK and per stop. With a track stopped for minutes it makes no difference. */
+/* The silence freeze's STATE threshold, as a fraction of BN_QUIET_TOL relative to the state's magnitude (see
+ * bn_quiet_xeps and the freeze in run()). Watching the output alone is not enough: with the output already near
+ * -140 dBFS the coupling capacitors are still recharging inside. The factor only sets how long the freeze takes to
+ * engage (stricter = later); 0.3 keeps a wide margin on the error the freeze introduces, where 1.0 sat at the edge. */
 #ifndef BN_QUIET_XEPS_K
 #define BN_QUIET_XEPS_K 0.3
 #endif
-#ifndef BN_QUIET_XEPS
-#define BN_QUIET_XEPS 1e-10
-#endif
 
 #define BN_MAX_BLOCK 8192
+
+/* The silence freeze watches this many of the engine's capacitor histories: every one of them (the systems carry
+ * 67-80); an engine with more never freezes. -DBN_QUIET_NX=64 is the gate's arm (the first 64 only, as before). */
+#ifndef BN_QUIET_NX
+#define BN_QUIET_NX 96
+#endif
+/* how close to its idle twin the supply must be before the freeze, as a multiple of BN_QUIET_TOL of each state */
+#ifndef BN_QUIET_PSU_K
+#define BN_QUIET_PSU_K 1.0
+#endif
 
 /* Port indices and symbols are public API (lv2/mk81.ttl, lv2/frozen_symbols.txt): a host saves sessions and
  * automation by them, so new ports are APPENDED, never inserted or renumbered. */
@@ -153,7 +96,7 @@ typedef enum {
     BN_IN        = 0,
     BN_OUT       = 1,
     BN_TRIM      = 2,   /* output level, in dB                */
-    BN_OVERSAMPLE = 3,  /* one-value port: the engine runs at 2x whatever it says (the symbol is public API and stays) */
+    BN_OVERSAMPLE = 3,  /* ignored (the factor is `hq`'s); kept because the symbol is public API */
     BN_VOL       = 4,   /* the panel knobs: 0..1              */
     BN_TREBLE    = 5,
     BN_MIDDLE    = 6,
@@ -164,12 +107,8 @@ typedef enum {
     BN_US        = 11,  /* the export (6550) version 0/1: the model display's list on the front */
     BN_LOW       = 12,  /* ON THE PANEL: the HIGH/LOW jacks */
     BN_PRESENCE  = 13,  /* ON THE PANEL: the PRESENCE knob */
-    BN_CAB_LOAD  = 14,  /* the Cabinet Feel knob on the back: CONTINUOUS "Cabinet feel" 0..1 —
-                         * 0 = the factory 8 ohm
-                         * (test bench), 1 = the real impedance of the
-                         * 4x12, and every position in between is a REAL CIRCUIT
-                         * (the resonance and the voice-coil inductance are
-                         * scaled). */
+    BN_CAB_LOAD  = 14,  /* Cabinet Feel 0..1 (the back panel): 0 = a resistive 8 ohm load, 1 = the 4x12's
+                         * impedance; in between, the speaker's R, L and C scaled (a real circuit at every point) */
     /* The two bypass-style switches. They are NOT two names for the same thing:
      *   BYPASS  = pass-through of the signal WITHOUT switching the plugin off. The
      *             DSP keeps running with its warm state, so coming back gives no
@@ -180,56 +119,40 @@ typedef enum {
     BN_POWER     = 16,  /* 1 = on (default), 0 = whole plugin out */
     BN_HUM       = 17,  /* mains hum, 0..1. DEFAULT 0 — see bn_hum() */
     BN_HISS      = 18,  /* Johnson hiss, 0..1. DEFAULT 0 */
-    BN_ERA       = 19,  /* 0 = new way (>=86, ours), 1 = old */
-    BN_HEAD      = 20,  /* 0 = the 100 W head, 1 = the 50 W head */
+    BN_ERA       = 19,  /* the 100 W heads' supply: 0 = new way, 1 = old way (half the reservoir) */
+    BN_HEAD      = 20,  /* 0 = the 100 W head, 1 = the 50 W head, 2 = the reissue (bn_head_port) */
     BN_BYPASS_PREAMP = 21,  /* 1 = skip the preamp; the input feeds w2 (the master wiper)
                              * directly and the power stage still runs. 0 = default. Crossfaded. */
-    /* The five FX LOOP ports and the POWER bypass cut at the SAME w2 seam as
-     * port 21. Their symbols are public API. */
-    BN_BYPASS_POWER  = 22,  /* 1 = skip the power stage; w2 (DC-free, aligned
-                             * with the power stage's latency) goes out at preamp level. */
-    BN_FX_LOOP       = 23,  /* 1 = loop active: live send and return mixed into w2 */
-    BN_FX_SEND       = 24,  /* audio OUT: DC-free w2, at preamp level (/BN_STAGE_GAIN) */
-    BN_FX_RETURN     = 25,  /* audio IN: what comes back from the effect, enters at C9 / the PI's grid */
-    BN_FX_MIX        = 26,  /* 0..100 %: 0 = dry (the loop only SENDS), 100 = series (return only) */
-    BN_FX_RETURN_LVL = 27,
-    /* engine port: fixed at 1 (the neural LSTM-32 power stage, the only one the plugin carries). Kept so the
-     * port indices and symbols do not move; run() ignores its value. */
-    BN_ENGINE        = 28,
-    BN_N_PORTS   = 29
+    /* The FX loop ports and the POWER bypass cut at the same w2 seam as port 21. */
+    BN_BYPASS_POWER  = 22,  /* 1 = skip the power stage; the DC-free w2 goes out at preamp level */
+    BN_FX_LOOP       = 23,  /* 1 = loop on: the reissue card's loop, in series */
+    BN_FX_SEND       = 24,  /* audio OUT: the card's send, at preamp level (/BN_STAGE_GAIN) */
+    BN_FX_RETURN     = 25,  /* audio IN: what comes back from the effect, into the card's return stage */
+    BN_FX_MIX        = 26,  /* not read: the card's loop is series only; kept so saved sessions load */
+    BN_FX_RETURN_LVL = 27,  /* return gain 0..2, applied before the return stage */
+    BN_ENGINE        = 28,  /* ignored: one engine; kept so saved sessions load */
+    BN_N_PORTS   = 29,  /* the ports of lv2/mk81.ttl before tools/ttl_ultra.py appends `hq` and `fx_level` */
+    /* the oversampling factor: 0 = 2x (default), 1 = 4x. Symbol `hq`, the same switch's name on the other plugins */
+    BN_HQ            = 29,
+    /* the reissue effects card's LEVEL switch: 0 = Line (the hot send, about a third of the master signal; the
+     * return x3.1), 1 = Pedal (the guitar-level send, about 1/15; the return x15.5) */
+    BN_FX_LEVEL      = 30,
+    BN_N_PORTS_ULTRA = 31
 } BnPortIndex;
 
-/* The ring of the power bypass's DRY path, at fs_hi. The power stage's latency (bn_pw_lat: the net's rate
- * converter delay) is part of the declared latency; w2 is delayed the same so the power <-> w2 crossfade neither
- * combs nor leads. Bounded when read, like BN_DRY_RING. */
-/* ⛔ This ring must be at least as long as the rate converter's ring.
- * `bn_nn_rate` is sized "for a 48 kHz net at 768 kHz" (BN_NN_RATE_RING 2048) and can return a
- * `delay` above 1023; with a shorter ring `bn_pw_lat` clips it to BN_PB_RING-1, so
- * `nn_delay = pb_delay - nnr.delay` comes out NEGATIVE and the read index `rn = nn_pos - nn_delay`
- * runs off the TOP of the ring — the wrap in the power stage only covers the bottom side. It does not
- * crash: it reads fields of the struct itself and plays them as audio, with nothing to give it away.
- * It is not reachable with the four shipped arms (all 96 kHz), but a 48 kHz arm would reach it.
- * The `_Static_assert` ties the two constants so they cannot drift apart silently. It costs 128 KB
- * across the four configurations. */
-#define BN_PB_RING 2048
-_Static_assert(BN_PB_RING >= BN_NN_RATE_RING,
-               "BN_PB_RING must carry any delay bn_nn_rate can produce, or nn_delay goes negative");
 
-/* Full-scale time of the ramps that carry the net's conditioning knobs (presence, bias, cabinet feel). */
+/* Full-scale time of the bias knob's ramp at fs_hi (bias_now). Presence and Cabinet Feel follow the pots'
+ * slew instead (BN_KNOB_SLEW_S), since a move of either rebuilds the engine's matrices. */
 #ifndef BN_COND_RAMP_S
-#define BN_COND_RAMP_S 0.010
+#define BN_COND_RAMP_S 0.020
 #endif
 
-/* The five preamp pots (volume, treble, middle, bass, master) move through the circuit's matrices, rebuilt once
- * per chunk while a pot moves, so a moving pot is a staircase: each rebuild is a small step at the output, and its
- * size is the pot's travel per rebuild = chunk / (slew time x rate). A full-scale step at the 2x default, input
- * 0.0025 (the click test: 2nd difference against the steady signal, bar 5x), measured on master,
- * the worst pot: 32 samples / 30 ms 68.9x · 8 / 30 ms ~18x · 1 / 30 ms 2.7x · 8 / 240 ms 2.9x · 4 / 120 ms 3.3x.
- * The travel per rebuild sets the click, the chunk sets the cost while moving: a rebuild every 1/6000 s
- * (8 samples at 48 kHz, the same TIME at every rate) and a full-scale slew of 240 ms give 1/1440 of full scale
- * per rebuild. Cost measured on a low-power 4-core x86 CPU (2x, 128-sample blocks): held 61 % of real time, full-scale
- * jumps once a second 70 % mean and a worst block of 100 % of its budget (78 % held); a 1-sample chunk at
- * 30 ms gave the same click at a 271 % worst block. */
+/* The pots (volume, treble, middle, bass, master, presence, Cabinet Feel) live in the circuit's matrices, rebuilt
+ * once per chunk while a pot moves, so a moving pot is a staircase whose step is its travel per rebuild =
+ * chunk / (slew time x rate). The travel per rebuild sets the click, the chunk sets the cost while moving: a rebuild
+ * every 1/6000 s (8 samples at 48 kHz, the same TIME at every rate) with a 240 ms full-scale slew moves 1/1440 of
+ * full scale per rebuild, under the click bar (2nd difference within 5x the steady signal) at a bounded cost; a
+ * 30 ms slew needed a 1-sample chunk for the same click. */
 #ifndef BN_KNOB_CHUNK_S
 #define BN_KNOB_CHUNK_S (1.0 / 6000.0)
 #endif
@@ -240,51 +163,18 @@ _Static_assert(BN_PB_RING >= BN_NN_RATE_RING,
 /* A complete set of state that depends on the oversampling factor. */
 typedef struct {
     BnOversampler os;
-    BnDK          dk;
-    BnDKVar       dkvar;
-    /* DC blocker: the plate rests at ~255 V and that is not audio */
-    double        dc_x1, dc_y1;
-    /* The blocker's pole, DERIVED from fs_hi. A fixed literal 0.9995 inside the
-     * oversampled loop would make its corner NOT a frequency: it would scale
-     * with the oversampling factor and with the host rate (7.6 Hz at factory,
-     * but 30.6 at 8x@48k and 61 at 8x@96k). In audio terms raising the QUALITY
-     * would cut real bass: −0.57 dB at low E at 8x@48k and −1.92 at 8x@96k,
-     * plus the phase rotation, and it would contaminate any A/B between
-     * factors. So fc is fixed. */
-    double        dc_a;
-    /* SNAPSHOT of the operating point, taken after the DC init and the 256
-     * settling iterations. It is the RECOVERY path: if the DK state x is
-     * poisoned (a NaN coming in from anywhere), activate() restores it; without
-     * it the only way out would be to re-instantiate.
-     * ⚠️ Setting x to ZERO, which is what bn_dk_reset does, does NOT work: zero
-     * is the COLD amp (discharged capacitors), not its operating point — there
-     * would be a huge transient on every activate(). The snapshot is restored. */
-    double*       x_dc;      /* physical state: capacitors and inductors */
-    double*       v_dc;      /* valve voltages at the DC point           */
-    int           n_x_dc, n_v_dc;
     /* --- THE w2 SEAM (preamp/power bypass, FX loop) ----------------------
-     * A DC blocker of its OWN on w2 (corner BN_SEAM_HP_HZ, primed at w2's rest
-     * value so it starts settled): the send and the power bypass's dry path
-     * come out of it. The output one does NOT serve: it sees t8, which is
-     * already DC-free through the power stage's HP, and its 7,64 Hz corner is
-     * too high for a send (see BN_SEAM_HP_HZ). */
-    double        w2_dc;               /* w2's rest value after the DC init (V) */
+     * A DC blocker of its own on w2 (corner BN_SEAM_HP_HZ, primed at w2's rest
+     * value so it starts settled): the power bypass's dry path, and the send
+     * while the card is not running, come out of it. */
+    double        w2_dc;               /* w2's rest value (V): 0, the wiper after its coupling capacitor */
     double        seam_a;              /* the seam blocker's pole, from fs_hi */
     double        seam_dc_x1, seam_dc_y1;
-    double        pb_ring[BN_PB_RING]; /* w2 (AC) delayed by the power stage's latency (bn_pw_lat), at fs_hi */
-    double        nn_ring[BN_PB_RING]; /* the net's output delayed to the power stage's latency (bn_pw_lat) */
-    int           nn_pos;
-    int           pb_pos;
-    /* The net runs at its training rate (96 kHz) at any fs_hi, through a converter whose
-     * delay is fixed per fs_hi. The power stage's latency is then ONE number, bn_pw_lat(): the
-     * converter's delay rounded up to a whole host sample; the nn ring delays the net's output by
-     * the rounding. At fs_hi = 96 kHz the converter is inactive and the power stage adds no latency. */
-    BnNnRate      nnr;
     /* The FX loop's resampling pair: the send goes DOWN from fs_hi to the host
-     * rate and the return goes UP. It is a second set of halfbands with its own
-     * state (the plugin's set is already busy with the input and the output).
-     * It only runs with the loop active; it is zeroed when the loop engages. */
-    BnOversampler fxos;
+     * rate and the return goes UP. Its own FIRs (bn_fx_pair.h), not the main
+     * oversampler's: its round trip is the loop's own delay. It only runs with
+     * the loop active; it is zeroed when the loop engages. */
+    BnFxPair      fxos;
     BnFxComp      fxc;            /* the loop's complement: what the host cannot carry, with the host delay estimated */
     int           ready;           /* 1 = already built */
 } BnCfg;
@@ -316,20 +206,30 @@ typedef struct {
     const float* fx_loop;          /* FX loop: switch */
     float*       fx_send;          /* FX loop: audio OUT (may be NULL) */
     const float* fx_return;        /* FX loop: audio IN (may be NULL) */
-    const float* fx_mix;           /* FX loop: 0 dry .. 100 series (%) */
+    const float* fx_mix;           /* FX loop mix port: not read (the card is series only) */
     const float* fx_return_lvl;    /* FX loop: return gain 0..2 */
-    const float* engine;           /* connected and never read: the port is fixed at 1 in the TTL */
-    BnNnLstm     nn[BN_NN_N_ARMS]; /* one LSTM-32 per (head, us) variant, bound at instantiate to the embedded blobs */
-    double       nn_fs;            /* the rate the nets were trained at (all four the same) */
-    int          nn_arm;           /* the slot whose state is live (head + 2*us) */
-    int          nn_arm_want;      /* the slot the head and US ports ask for; differs from nn_arm during a variant switch */
-    int          nn_hold;          /* fs_hi samples the power stage stays silent after a switch, so the new net's first output emerges from its ring and converter before the fade-in */
+    const float* engine;           /* connected and never read (port kept for saved sessions) */
+    const float* hq;               /* port 29: the factor, 1 = 4x, 0 = 2x (bn_os_target) */
+    const float* fx_level;         /* port 30: the reissue card's LEVEL, 0 = Line, 1 = Pedal */
+    /* The latency PAD: the plugin reports the LARGEST latency of its configurations at every factor and delays the
+     * wet output of the others by the difference, so the hq switch never moves the declared latency.
+     * pad_len = lat_max - the running configuration's own latency. Base-rate samples. */
+#define BN_PAD_RING 512
+    double       pad_ring[BN_PAD_RING];
+    int          pad_pos, pad_len, lat_max;
+    /* The declared latency also carries the FX loop's own round trip (bn_fxp_latency), whether the loop is on or
+     * not, so switching the loop never moves it. pad_len is the loop-OFF pad; pad_len_on = pad_len - the running
+     * pair's round trip, the loop-ON pad (the loop itself supplies the round trip). fx_eng_now crossfades the two
+     * taps in 10 ms toward the DOMINANT path: the return when the loop is on with mix >= 50 %, else the direct one
+     * (the loop on at mix 0 stays the loop off, sample for sample). Never weighted by the mix itself: a
+     * mix-weighted blend of two taps would comb. */
+    int          pad_len_on;
+    double       fx_eng_now;
     int          dry_from_ports;   /* first run() after activate(): take dry_mix from the ports, which are only valid there */
-    double       nn_gain;          /* the power stage's output gain: 1 in steady state, 10 ms ramps at fs_hi through 0 on a variant switch */
-    /* the net's conditioning knobs (presence, bias, cabinet feel) as applied: linear ramps at fs_hi toward the ports,
-     * full scale in BN_COND_RAMP_S. The first run() after activate() takes them, and hum_now, from the ports
-     * (cond_from_ports). */
-    double       nn_pres_now, nn_bias_now, nn_cab_now;
+    /* the bias as a linear ramp at fs_hi toward its port, full scale in BN_COND_RAMP_S (the engine's bias source;
+     * presence and Cabinet Feel reach the engine through ultra_pres_now / ultra_cab_now). The first run() after
+     * activate() takes it, and hum_now, from the ports (cond_from_ports). */
+    double       bias_now;
     double       hum_now;          /* the hum's level as applied: a 10 ms ramp at the host rate toward the port */
     int          cond_from_ports;
     double       byp_pow_mix;      /* 0 = power stage active, 1 = bypassed; 10 ms ramp at fs_hi */
@@ -337,30 +237,20 @@ typedef struct {
     double       fx_lvl_now;       /* FX: applied return level (ramp) */
     double       fx_send_gain;     /* FX: fade of the send at the base rate, 0..1 */
     int          fx_running;       /* FX: 1 = the resampling pair is warm */
-    double*      fx_ret_lo;        /* FX: sanitised return at the base rate / downsampled send (n) */
+    double*      fx_ret_lo;        /* FX: sanitised return at the base rate, then the downsampled send (n) */
     double*      fx_ret_hi;        /* FX: return upsampled to fs_hi (n*factor) */
     double*      fx_send_hi;       /* FX: w2 (AC, at preamp level) at fs_hi (n*factor) */
     double*      fx_rcap;          /* FX: the host's return of this chunk, kept for the delay estimator (n) */
     int          low_state;        /* -1 forces the first apply */
-    int          us_state;         /* -1 forces the first apply; the US preamp uses 250k/25k */
     double       byp_pre_mix;      /* 0 = preamp active, 1 = bypassed; 10 ms ramp in the loop */
     /* 10 ms ramp to enter and leave bypass/power without a click: a hard jump
      * from wet to dry is a step in the signal, and that is audible. */
     double       dry_mix;          /* 0 = plugin, 1 = pass-through */
-    /* The Newton's relative tolerance is an additive noise floor: at 3e-5 a silent input gives a stationary -63 dBFS
-     * tick train (the power stage multiplies the preamp's jitter x15) and the quiet freeze never engages; at 1e-6 the
-     * floor is -95 dBFS. The tolerance follows the SOLVER INPUT (after drive and hiss) with hysteresis: fine (1e-6)
-     * below 1e-3 peak, normal above 3.16e-3. Keyed on the solver input on purpose: the ticks scale with the tolerance,
-     * not with the jack level, so a low drive setting simply spends more time in the fine mode (cost, not fidelity). */
-    double       tol_norm, tol_fine;
-    int          tol_fine_on;
-    double       tol_env, tol_env_decay;   /* the input peak follower at fs_hi and its 50 ms release factor */
     /* The DRY path is delayed by the same latency the plugin reports.
      * Without this, on bypass the signal would come out EARLY relative to the
      * other tracks (the host is already compensating the latency we declare),
-     * and the crossfade would mix two misaligned signals -> comb. 512 is
-     * plenty: the maximum is ~90 samples (82 from the oversampler at 8x + the
-     * power stage's latency / factor). */
+     * and the crossfade would mix two misaligned signals -> comb. 512 holds
+     * the declared latency (lat_max) with room to spare. */
 #define BN_DRY_RING 512
     double       dry_ring[BN_DRY_RING];
     int          dry_pos;
@@ -368,53 +258,58 @@ typedef struct {
 
     double sample_rate;
 
-    /* EVERYTHING that depends on the oversampling factor lives together, and
-     * there are FOUR sets, one per factor. Building one on the fly from run()
-     * when the knob moves would be a textbook real-time violation: memory
-     * allocation, plus a DC solve, plus 256 settling iterations, all on the
-     * audio thread (measured peak 7.8 ms). The four are built in instantiate
-     * and changing factor is moving a pointer. */
+    /* EVERYTHING that depends on the oversampling factor lives together, one
+     * set per factor, indexed by bn_osi (1, 2, 4, 8x; the product builds 2x
+     * and 4x). They are built in instantiate, since building one from run()
+     * would allocate on the audio thread; changing factor moves a pointer. */
     BnCfg          cfg[4];
     BnCfg*         c;              /* the ACTIVE configuration */
     BnPsu          psu;            /* the supply sag, at block rate */
-    BnPsu          psu_idle;       /* the same supply stepped with the IDLE currents: node X at rest for this head/edition/era */
-    double         vx_now;
+    BnPsu          psu_idle;       /* the same supply stepped with the IDLE currents: the rest reference for this head and era */
     /* The supply ticks on a FIXED grid of cells aligned to
      * the stream (256 samples at 48 kHz, scaled with the rate), not on the host's blocks. Chunks
-     * are cut at the cell edges; the PSU, the dynamic bias and the rail's interpolation advance
-     * once per cell, fed with the follower's maximum over the whole previous cell. */
+     * are cut at the cell edges; the supply, the bias reservoir and the B+ ramp advance once per
+     * cell, fed with the previous cell's load. */
     uint32_t       psu_grid;       /* cell length, base samples */
     uint32_t       psu_phase;      /* base samples already processed in the current cell */
     double         pk_cell;        /* the follower's max so far in the current cell */
-    double         vx_cell0, dvx_hi;   /* the preamp rail at the cell's start and its slope per fs_hi sample */
-    /* The NET's rail: the rail at the netlist's `htraw` equivalent — plates (vc23)
-     * plus RSAG times the rectifier's current — normalised to its idle value. That is where the truth the nets
-     * learn from takes its `railfile=` (above RSAG, the choke and the 20k); the PI rail the former cascade scaled by
-     * is that rail already filtered by 20k x 100 uF (tau 2 s), and fed to the net it made the power stage sag
-     * slowly and deep. Against the consistent truth: worst frame +8,63/+12,26/+4,96 -> +6,12/+12,37/+3,16,
-     * the net alone's reach; no retraining (the pairs' rail tracks are applied at htraw). */
+    /* rq: the rail at the netlist's `htraw` point (plates vc23 + RSAG x the rectifier current), normalised to its
+     * idle value, per cell and ramped per fs_hi sample (~1 at rest). Computed in the product too; read only by the
+     * measurement builds' old B+ / bias laws (oldb, oldlaw) and as a start's rail. */
     double         rq_now, rq_cell0, drq_hi;
-    double         w2_peak_fast;   /* the master-wiper envelope the PSU map and the bias read (release 5 ms) */
+    /* The engine's bias source: the circuit's bias-reservoir law, z -> 1 - g (ich - ich_rest) with a lag tau;
+     * zss per supply cell, z per engine sample (bn_ultra_bias.h). Its REST reference psu_urest is the same supply
+     * stepped with the engine's OWN rest currents (its output valves at the DC operating point of its last start). */
+    BnPsu          psu_urest;
+    double         urest_ipl, urest_isc;
+    int            urest_ok, oldrest;
+    double         bht_zss, bht_z, bht_a;
+    double         q_psu[7];       /* the supply's states and the bias reservoir at the start of the freeze's still run */
+    /* The engine's B+ source (htraw): the supply's rectifier source, per supply cell, ramped per engine sample */
+    double         u1_now, u1_cell0, du1_hi;
+    /* measurement builds only (-DBN_DUMP_SLOW; 0 in the product): alternative B+ / bias laws (oldlaw, oldb, bmode,
+     * oldrest) and fx_ident, the loop's return := its own send of the same sample (an ideal host) */
+    int            oldlaw, oldb, bmode;
+    int            fx_ident;
+    double         w2_peak_fast;   /* the last closed cell's peak of the master-wiper envelope: the PSU map reads it */
     double         env_fast;       /* its per-sample peak follower, at fs_hi */
     float          knobs_last[5];
     int            os_factor;
-    /* Ramp around an oversampling change. Without it the switch pops: a
-     * sample-to-sample step of 1.02-1.35 against 0.268 in steady state (x3.8
-     * to x5.0) with a sustained low E (measured). The switch happens in silence:
+    /* Ramp around an oversampling change, which happens in silence (without it
+     * the switch pops):
      *   phase 1 = ramping down (with the OLD config)
-     *   phase 2 = at zero, rebuild on the next block
+     *   phase 2 = at zero, switch on the next block
+     *   phase 4 = muted while the new config settles (BN_OS_SETTLE_S)
      *   phase 3 = ramping up (with the NEW one)
-     * It is not a crossfade —that would need both chains running at once, which
-     * is exactly the CPU there is not— but a short gap: the quality knob is not
-     * moved while playing. */
+     * Not a crossfade, which would run two engines at once: a short gap, as
+     * the quality switch is not moved while playing. */
     int            os_want;
     int            os_phase;
     int            os_hold;          /* phase 4: samples of silence left while the new factor settles */
     float          os_gain, os_step;
-    /* The FIRST block is not ramped: on opening the plugin there is nothing to
-     * smooth, and if the host instantiates it with a factor other than the
-     * factory one the ramp would put a 10 ms fade into the start (and break
-     * the byte-for-byte identity of the measurements at 4x). */
+    /* The FIRST block after instantiate is not ramped: there is nothing to
+     * smooth, and a host whose first run() asks for 4x would otherwise get a
+     * fade at the start. */
     int            os_primero;
 
     double* buf_in;      /* block at the base rate, in volts */
@@ -423,7 +318,8 @@ typedef struct {
 
     float  trim_lin, smooth_coef;
     uint32_t knob_chunk;           /* the chunk while a preamp pot moves, in samples (BN_KNOB_CHUNK_S) */
-    /* silence bypass (see the block in run()) */
+    uint32_t knob_phase;           /* samples into the current knob cell: the pots' grid, aligned to the stream (MK81#202) */
+    /* the silence freeze (see the block in run()) */
     int    quiet_run;           /* consecutive samples with a still output */
     int    frozen;              /* 1 = engine frozen */
     double quiet_last;          /* last output sample seen */
@@ -433,45 +329,53 @@ typedef struct {
     double psu_i_total;         /* the supply's total current this cell, A (the hum's ripple reads it) */
     int    era_now;             /* era applied to the PSU */
     int    head_now;            /* head applied (0=100W, 1=50W) */
-    double x_snap[64];          /* snapshot of the circuit state (nx=18) */
-    /* Moving average of the state during the still blocks. The state of a SINGLE sample carries
-     * the Newton's jitter (measured: 0,116 x tol), which on unfreezing shifts the operating point
-     * PERSISTENTLY — it is not a click. Averaged over ~10 blocks that jitter cancels: ANMR of the
-     * worst frame -8,62 -> -10,66 dB. The silence bypass is active by default: see BN_QUIET_EPS. */
-    double x_avg[64], v_avg[16];
-    int    avg_ok;
-    int    quiet_rel;           /* 1 = silence thresholds TIED to dk.tol (BN_QUIET lever) */
+    int    ri_now;              /* the reissue applied (head port 2: a 100 W head, head_now 0) */
+    double x_snap[BN_QUIET_NX]; /* the engine's capacitor histories at the last still block (see the freeze) */
+    /* ULTRA: the whole amp solved at fs_hi */
+    void*        ultra;            /* the engine's memory (bn_ultra_size()), one variant at a time */
+    int          ultra_v;          /* the variant initialised in it, bn_ultra_want's numbering (-1 = none) */
+    int          ultra_failed;     /* this run()'s start found no operating point: not retried until the next run() */
+    double       ultra_gain;       /* the output's gain through a head / edition switch (fade out, re-start, fade in) */
+    int          ultra_hold;       /* engine samples the gain holds at 0 after a re-start */
+    BnUltraKnobs ultra_kn;         /* the knobs the engine's matrices were built for */
+    /* The loop ON runs the reissue card's system: the card variant BN_ULTRA_FX(v, level), seeded from the heard
+     * engine through bn_card_seed_on, and its return half (IC1b, the zeners) on nlcore's nodal solver, one per
+     * LEVEL x factor (built at instantiate: nl_nodal_init allocates) */
+    void*  ultra_card;
+    void*  card_ret[2][2];         /* [level][factor index: 0 = 2x, 1 = 4x] */
+#ifdef BN_SEND_TWIN
+    void*  card_snd[2][2];         /* the send TWIN, [level][factor], at BN_SEND_K(fi) x the engine rate */
+    double card_w2p, card_w2pp;    /* w2 one and two engine samples back: the twin's parabola through t-2, t-1, t */
+#endif
+    int    card_on, card_lv;
+    double card_send;              /* the card's send node (IC1a follows it) after the last engine sample */
+    double card_fxr;               /* its return half's output (what drives the PI through C1) at that sample */
+    /* The ON / OFF switch: the output crossfades heard <-> card while both engines run. At ON the heard (loop-free)
+     * engine keeps playing for card_wait engine samples (the chunk the return arrives late, the send's 10 ms ramp
+     * and the loop's resamplers), then fades to the card over BN_CARD_XF; at OFF the heard engine, seeded from the
+     * card, fades in while the card still runs on the return the host is handing back */
+    double card_g;                 /* the card's share of the output, 0..1 */
+    long   card_wait;              /* engine samples left before the fade to the card starts */
+    long   card_wait0;             /* the wait's length at ON (read by -DBN_CARD_SPREAD builds) */
+    int    card_fading_out;        /* 1 while the card fades out after OFF */
+    double       ultra_pres_now;   /* presence as the engine applies it: slewed like the pots, rebuilt per chunk */
+    double       ultra_cab_now;    /* Cabinet Feel as the engine applies it (the 4x12's R, L, C), slewed like the pots */
+    double       ultra_ipl_acc, ultra_isc_acc;   /* the output valves' plate / screen current summed over the cell */
+    long         ultra_ncur;
+    double       ultra_ipl, ultra_isc;   /* the last closed cell's mean: the supply's load */
+    int          ultra_cur_ok;     /* 1 once a cell has closed since the last start: ultra_ipl / ultra_isc replace the map */
+    /* The SEND system (src/prepig/: preamp + phase inverter with the output valves' grids conducting, its rail and
+     * NFB read from the heard engine one sample late) gives the loop-free wiper while the preamp bypass acts; the
+     * heard engine then has C9's top DETACHED and driven by the bypass's mix. It is seeded from the heard engine the
+     * sample the bypass starts acting; idle again, the heard engine is re-attached. send_kn: the knobs its matrices
+     * were last built for. */
+    void*        ultra_send;
+    int          send_on;
+    BnUltraKnobs send_kn;
     double frozen_out;          /* value emitted while frozen */
 } BritishNoise;
 
-/* EXPERIMENT hooks (not documented in the ttl). They are read ONCE per
- * process. BN_MAXIT<=0 is ignored (otherwise max_iter=0 and the Newton would
- * never iterate).
- * These getenv calls live in bn_build_cfg, which only instantiate calls;
- * rebuild_oversampler, reachable from run(), only moves the self->c pointer.
- * The caching is still right for another reason: an experiment lever must not
- * be able to change mid-session. */
-static int bn_env_maxit(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        cached = 48;
-        const char* e = getenv("BN_MAXIT");
-        if (e) { const int v = atoi(e); if (v > 0) { cached = v; } }
-    }
-    return cached;
-}
-
-static double bn_env_tol(void)
-{
-    static double cached = -1.0;
-    if (cached < 0.0) {
-        cached = 0.0;
-        const char* e = getenv("BN_TOL");
-        if (e) { const double v = atof(e); if (v > 0.0) { cached = v; } }
-    }
-    return cached;
-}
+static int bn_cfg_lat(const BnCfg* c, int factor);
 
 /* index of the configuration for each legal factor (1,2,4,8) */
 static int bn_osi(int factor)
@@ -482,9 +386,9 @@ static int bn_osi(int factor)
     }
 }
 
-/* BUILDS a configuration. This is the expensive part: memory allocation,
- * building the nodal system, DC solve and 256 settling iterations. It is only
- * called from instantiate — NEVER from the audio thread. */
+/* BUILDS a configuration: its oversampler, the FX loop's resampler pair and complement (all allocate), the seam
+ * blocker at rest, and the supply's and knobs' starting state. Called from instantiate only, NEVER from the audio
+ * thread. */
 static void bn_build_cfg(BritishNoise* self, int factor)
 {
     const int ci = bn_osi(factor);
@@ -501,253 +405,67 @@ static void bn_build_cfg(BritishNoise* self, int factor)
         bn_os_free(&self->c->os);
         return;
     }
-    bn_os_free(&self->c->fxos);
-    if (bn_os_init(&self->c->fxos, factor, BN_MAX_BLOCK) != 0) {
-        bn_os_free(&self->c->fxos);
+    bn_fxp_free(&self->c->fxos);
+    if (bn_fxp_init(&self->c->fxos, factor, BN_MAX_BLOCK) != 0) {
+        bn_fxp_free(&self->c->fxos);
         bn_os_free(&self->c->os);
         return;
     }
     bn_fxc_free(&self->c->fxc);
     if (bn_fxc_init(&self->c->fxc, factor, BN_MAX_BLOCK, self->sample_rate) != 0) {
         bn_fxc_free(&self->c->fxc);
-        bn_os_free(&self->c->fxos);
+        bn_fxp_free(&self->c->fxos);
         bn_os_free(&self->c->os);
         return;
     }
-    if (self->c->dkvar.dk) { bn_dkvar_free(&self->c->dkvar); }
-    bn_dk_free(&self->c->dk);
     const double fs_hi = self->sample_rate * factor;
-    /* The return value is checked: on OOM or with a singular mutual-inductance
-     * matrix, carrying on would mark ready = 1 on a half-built system. */
-    if (bn_dk_init(&self->c->dk, &BN_PREAMP2203_CIRCUIT, fs_hi) != 0) { return; }
-    /* Valve: by default the plugin's OWN model (bn_tube_own, the shipped one).
-     * The ORACLE build with a third-party reference valve model (for nulls against ngspice) is
-     * compiled with -DBN_TUBE_AYUMI_ORACLE and adds src/dsp/bn_tube.c to the
-     * link (make plugin-oracle). */
-    bn_tube_own_tables_init();
-    /* The selector picks ONCE between the variant with and without the trims
-     * check. With BN_TRIMS unset —the normal case— the check would do nothing
-     * and would be paid on the device's hottest path. */
-    self->c->dk.device          = bn_tube_own_pick_tab_x4();
-    self->c->dk.device_currents = bn_tube_own_pick_tab_currents_x4();
-    /* The OWN triode sets J[1] = 0.0 literally (bn_tube_own.c): the grid
-     * current of the D&Z model depends only on vgk. That leaves 32 of the 128
-     * madds of the Jg assembly multiplying by an exact zero — see
-     * jdev_ig_indep_va in bn_dk.h. Byte-identical, not approximate. */
-    self->c->dk.jdev_ig_indep_va = 1;
-    self->c->dk.jdev_blockdiag  = 1;
-    /* Real-time tolerance: 3e-5 in the plugin, chosen together with the
-     * silence bypass (see BN_QUIET_*). The ORACLE/bench paths stay at 1e-8:
-     * this is the plugin only.
-     *
-     * Loosening the tolerance only trims Newton iterations; the
-     * FACTORISATIONS do not drop (1.035/sample in every case), and iterations
-     * are ~64% of the time. Measured with hard material (trebles with a dry
-     * attack) at drive +12 dB and 4x, over 1.54 M samples:
-     *   tol 1e-7 -> 5.173 iterations/sample   (reference)
-     *   tol 1e-6 -> 4.636 iterations/sample   (-10.4%), output at -125.3 dB
-     *   tol 1e-5 -> 4.130 iterations/sample   (-20.2%), output at  -89.4 dB
-     *   tol 1e-4 -> 3.593 iterations/sample   (-30.5%), output at  -69.8 dB
-     * Scored on ANMR instead of dB re peak: the preamp at 1e-4 against the
-     * preamp at 1e-6, over 6 s of a real DI, nulls at -88,1 dB with a worst
-     * ANMR frame of -29,4 dB (acceptable below -10), for 2,29 iterations per
-     * sample instead of 3,00 (-24 %) and -11 % of the preamp's time (five
-     * interleaved pairs, low-power 4-core x86 CPU). 1e-5 gave -129 dB / -72 for only -8 % of
-     * iterations. The BN_TOL lever is still read once, to measure again. */
-    self->c->dk.tol             = 3e-5;
-    /* Real-time guard of the Newton (calibrated against the plugin's REAL
-     * profile, which uses chord): guitar at drive +12 dB needs up to ~48
-     * iterations at isolated samples — a cap of 48 gives IDENTICAL output
-     * (−600 dB) and still protects against a ceiling of 100 on pathological
-     * blocks. NOTE: a cap of 16, calibrated with the histogram WITHOUT chord,
-     * changed the output at −26 dB: the guard is calibrated against the path
-     * that actually runs. */
-    /* the env reads are cached in bn_env_*(): this function runs at instantiate only, never from run() */
-    self->c->dk.max_iter        = bn_env_maxit();
-    { const double t = bn_env_tol(); if (t > 0.0) { self->c->dk.tol = t; } }
-    self->tol_norm = self->c->dk.tol;
-    { const char* e = getenv("BN_TOL_FINE"); const double tf = (e && *e) ? atof(e) : 1e-6;
-      self->tol_fine = (tf > 0.0 && tf < self->tol_norm) ? tf : self->tol_norm; }
-    self->tol_fine_on = 0; self->tol_env = 0.0;
-    /* Persistent chord + explicit inverse, both ON in the product.
-     * Persistent chord: the LU of the last factorisation survives across samples and the
-     * adaptive refresh (`chord_refresh` in bn_dk.c: 0.3 since 24-Sep, 0.5 before) refactors only when an iteration
-     * fails to shrink the residual below that ratio of the previous one. Explicit inverse: the inverse of Jg is built once per factorisation and
-     * every Newton step is an 8x8 matvec instead of the serial triangular solve. Measured on 6 s
-     * of DI at os 2 (idle, four alternating cycles): 490-531 ms -> 364-381 (-26 % of the plugin);
-     * against the engine at tol 1e-6 the preamp lands at -89,6 dB / -37,8 worst frame where the
-     * old start read -88,1 / -29,4; the explicit inverse's output is the plain chord's to -152,6 dB
-     * re peak. Product gates (block invariance, fs/os invariance, RT safety) pass with both on.
-     * The levers switch them OFF: BN_CHORD=0 and BN_CHORD_INV=0 (read once). The predictor
-     * (BN_PRED) stays off: it is exclusive with the chord. */
-    { static int chord = -1, inv = -1;
-      if (chord < 0) { const char* e = getenv("BN_CHORD"); chord = (e && e[0] == '0') ? 0 : 1; }
-      if (inv < 0)   { const char* e = getenv("BN_CHORD_INV"); inv = (e && e[0] == '0') ? 0 : chord; }
-      self->c->dk.chord_persist = chord;
-      self->c->dk.solve_inverse = inv; }
-    /* Extrapolating v helps MOST below 4x, because that is where the warm
-     * start is worst (iterations rise as the rate drops: 5.86 at 192k, 6.69 at
-     * 96k, 7.91 at 48k).
-     *
-     * Measured on the preamp, bench with hard material:
-     *      96 kHz  33.3% -> 23.2% of a core   (iter 6.69 -> 4.56)
-     *     192 kHz  57.7% -> 43.4%             (iter 5.86 -> 3.94)
-     * and on the full plugin at 2x, own work: 31.9% -> 23.9% on average.
-     *
-     * And it does NOT change the sound: null against the path without it
-     * -145.4 dB rms / -106.4 peak at 2x, and -141.9 / -103.4 in the abuse
-     * corner (1.5 V, steps, silence-to-full, full-scale noise, knobs at max),
-     * with finite output. At 4x it is BIT-EXACT.
-     *
-     * (The flag is poison for the FULL-AMP circuit at the push-pull's
-     * cut-off-to-conduction transition. That is another circuit: the preamp
-     * does not switch like that.) */
-    self->c->dk.extrapolate_v   = 1;
-    /* variable parts: 9 pot sections + 4 contacts of the HIGH/LOW jack
-     * (switched by Woodbury, without re-init and with the state x intact) */
-    {
-        int var_idx[BN_PREAMP2203_N_POTS + BN_PREAMP2203_N_JACK];
-        for (int k = 0; k < BN_PREAMP2203_N_POTS; ++k) {
-            var_idx[k] = BN_PREAMP2203_POT_IDX[k];
-        }
-        for (int k = 0; k < BN_PREAMP2203_N_JACK; ++k) {
-            var_idx[BN_PREAMP2203_N_POTS + k] = BN_PREAMP2203_JACK_IDX[k];
-        }
-        /* The return value MUST be checked. It returns -1 if nv exceeds
-         * BN_DK_NV_MAX, if the dimensions do not match or if there are mutual
-         * inductances, and leaves the struct zeroed or with nv set and the
-         * pointers NULL. The first run() would go through bn_apply_vars ->
-         * bn_dkvar_set and dereference NULL: SIGSEGV on the audio thread. It
-         * cannot fire with the current netlist (13 variable parts, no
-         * mutuals), but regenerating the netlist is the realistic trigger. */
-        if (bn_dkvar_init(&self->c->dkvar, &self->c->dk, &BN_PREAMP2203_CIRCUIT, fs_hi,
-                          var_idx, BN_PREAMP2203_N_POTS + BN_PREAMP2203_N_JACK) != 0) { return; }
-    }
     self->low_state = -1;
-    self->us_state = -1;
     bn_psu_init(&self->psu);
     bn_psu_init(&self->psu_idle);
-    self->vx_now = BN_PREAMP2203_BPLUS_V;
     self->rq_now = 1.0; self->rq_cell0 = 1.0; self->drq_hi = 0.0;
+    self->bht_zss = 1.0; self->bht_z = 1.0; self->bht_a = 0.0; self->u1_now = 0.0;
     self->w2_peak_fast = 0.0;
     self->env_fast = 0.0;
-    for (int k = 0; k < 5; ++k) { self->knobs_last[k] = -1.0f; }  /* forces apply */
-
-    /* Operating point by static DC (bn_dk_dc_init): with C21 (tau=0.5 s) a
-     * brute-force warm-up would be seconds of audio in instantiate. */
-    double u[2] = { 0.0, BN_PREAMP2203_BPLUS_V };
-    double y[16];
-    if (bn_dk_dc_init(&self->c->dk, &BN_PREAMP2203_CIRCUIT, fs_hi, u) != 0) { return; }
-    for (int k = 0; k < 256; ++k) {          /* settle the numerical residual */
-        bn_dk_process(&self->c->dk, u, y);
-    }
-    /* SNAPSHOT of the operating point — HERE, not earlier.
-     * ⚠️ Taking it next to `ready = 1` would capture the state AT ZERO,
-     * because the DC init and these 256 iterations happen AFTER it. Measured:
-     * the output level sank by 81.8 % at the lowest input — the exact
-     * signature of an amp starting COLD.
-     * ⚠️ And `v` goes into the snapshot just like `x`: they are the valves'
-     * grid and plate voltages at their operating point (vgk ~ -2 V,
-     * vak ~ 250 V), not a numerical residual. */
-    self->c->n_x_dc = self->c->dk.n_states;
-    self->c->n_v_dc = self->c->dk.n_nl;
-    self->c->x_dc = (double*)calloc((size_t)self->c->n_x_dc, sizeof(double));
-    self->c->v_dc = (double*)calloc((size_t)self->c->n_v_dc, sizeof(double));
-    if (self->c->x_dc && self->c->v_dc) {
-        memcpy(self->c->x_dc, self->c->dk.x, sizeof(double) * (size_t)self->c->n_x_dc);
-        memcpy(self->c->v_dc, self->c->dk.v, sizeof(double) * (size_t)self->c->n_v_dc);
-    } else {
-        free(self->c->x_dc); free(self->c->v_dc);
-        self->c->x_dc = NULL; self->c->v_dc = NULL;   /* activate() honours this */
-    }
-    self->c->dc_x1 = 0.0;      /* activate() starts the blocker on the net's rest output */
-    self->c->dc_y1 = 0.0;
-    /* the seam: the w2 blocker starts settled at its rest value, and the dry
-     * ring carries the AC rest value, which is zero */
-    self->c->w2_dc = y[0];
+    for (int k = 0; k < 5; ++k) { self->knobs_last[k] = -1.0f; }  /* forces the first application */
+    /* the seam's w2 blocker starts at rest (0 V: the wiper after its coupling capacitor), the dry ring empty */
+    self->c->w2_dc = 0.0;
     self->c->seam_a = exp(-2.0 * BN_PI * BN_SEAM_HP_HZ / fs_hi);
-    self->c->seam_dc_x1 = y[0];
+    self->c->seam_dc_x1 = 0.0;
     self->c->seam_dc_y1 = 0.0;
-    memset(self->c->pb_ring, 0, sizeof self->c->pb_ring);
-    self->c->pb_pos = 0;
-    bn_nn_rate_init(&self->c->nnr, fs_hi, self->nn_fs);
 
-    /* DC blocker pole at a FIXED fc (7.64 Hz, the factory configuration's).
-     *
-     * For a one-pole filter the time constant is preserved across rates with
-     * a2 = a1^(fs1/fs2) — which is exactly what this pow does. It is written
-     * this way, and NOT as exp(-2*pi*fc/fs_hi), for a specific reason: at the
-     * factory setting (2x at 48k => fs_hi = 96000) the exponent is exactly
-     * 1.0, and pow(x, 1.0) returns x WITHOUT error, so the shipped case is
-     * BYTE-IDENTICAL to the literal 0.9995. The exponential form would give
-     * 0.99949980… instead of 0.9995 and would move the factory sound by
-     * rounding. Verified by measurement: exact null at 2x/48k. */
-    self->c->dc_a = pow(BN_DCBLOCK_A_REF, BN_DCBLOCK_FS_REF / fs_hi);
-
-    /* `ready = 1` must be the LAST thing, after bn_dkvar_init and bn_dk_dc_init
-     * (the same pattern as the early returns after bn_os_init and bn_dk_init).
-     * bn_dk_dc_init returns -2 when the static Newton falls back (not only on
-     * OOM): with ready already set, the config would be marked good with
-     * dc_a = 0.0, and the output blocker would degenerate into y = x - x1, a
-     * DIFFERENTIATOR (+6 dB/oct across the whole band), plus seam_a = 0,
-     * x_dc = NULL (activate() could never restore the operating point) and
-     * the reduced stage without init or prime. The plugin would instantiate
-     * fine and sound wrong, SILENTLY.
-     * ⇒ The flag is the LAST thing: reaching here means the config is whole. */
-
-    /* And "whole" includes FINITE. Nothing between bn_dk_dc_init and here
-     * checks that the operating point is a number: the static Newton can come back with a NaN
-     * in `v` without returning an error, the 256 settling iterations then spread it through
-     * `x`, and the snapshot copies it. With ready = 1 the config is used, activate() restores
-     * that NaN as the working point on every transport stop, and the plugin outputs silence or
-     * NaN for the rest of the session — with no error anywhere, which is the expensive part.
-     * ⚠️ x_dc/v_dc being NULL is a DIFFERENT case and stays legal: it means the calloc failed
-     * and activate() knows to skip the restore. Only a snapshot that EXISTS and is not finite
-     * is a broken config. */
-    if (self->c->x_dc) {
-        for (int k = 0; k < self->c->n_x_dc; ++k) {
-            if (!isfinite(self->c->x_dc[k])) { return; }
-        }
-    }
-    if (self->c->v_dc) {
-        for (int k = 0; k < self->c->n_v_dc; ++k) {
-            if (!isfinite(self->c->v_dc[k])) { return; }
-        }
-    }
     self->c->ready = 1;
 }
 
 /* The whole teardown of an instance, IN ONE PLACE.
  *
- * It frees every configuration regardless of `ready`: `bn_build_cfg` has SEVERAL early returns
- * AFTER allocating that leave a half-built config with `ready = 0`, and skipping those would leak
- * that memory forever. The failure paths of `instantiate` also come through here, so the DK/dkvar/os
- * of the configs and the weights of the four arms are freed too; otherwise a host that retries the
- * load in a loop would lose megabytes per attempt.
- * ⇒ Freeing a half-built config is SAFE: `self` comes from `calloc`, so the structs start at zero,
- * and bn_dk_free / bn_dkvar_free / bn_os_free / bn_nn_lstm_free are all free(NULL) + memset on a
- * zeroed struct. That is why no `ready` condition is needed. */
+ * It frees every configuration regardless of `ready`: `bn_build_cfg` has early returns AFTER
+ * allocating that leave a half-built config with `ready = 0`, and skipping those would leak.
+ * The failure paths of `instantiate` come through here too, so a host that retries the load in a
+ * loop loses nothing. Freeing a half-built or never-built config is safe: `self` comes from
+ * `calloc`, and bn_os_free / bn_fxp_free / bn_fxc_free accept a zeroed struct. */
 static void
 bn_teardown(BritishNoise* self)
 {
     if (!self) { return; }
     for (int ci = 0; ci < 4; ++ci) {
-        free(self->cfg[ci].x_dc);
-        free(self->cfg[ci].v_dc);
-        bn_dk_free(&self->cfg[ci].dk);
-        bn_dkvar_free(&self->cfg[ci].dkvar);
         bn_os_free(&self->cfg[ci].os);
-        bn_os_free(&self->cfg[ci].fxos);
+        bn_fxp_free(&self->cfg[ci].fxos);
         bn_fxc_free(&self->cfg[ci].fxc);
     }
-    for (int k = 0; k < BN_NN_N_ARMS; ++k) { bn_nn_lstm_free(&self->nn[k]); }   /* the packed weights */
     free(self->buf_in);
     free(self->buf_hi);
     free(self->buf_out);
     free(self->fx_ret_lo);
     free(self->fx_ret_hi);
     free(self->fx_send_hi);
+    free(self->ultra_card);
+    for (int lv = 0; lv < 2; ++lv) { for (int fi = 0; fi < 2; ++fi) { free(self->card_ret[lv][fi]); } }
+#ifdef BN_SEND_TWIN
+    for (int lv = 0; lv < 2; ++lv) { for (int fi = 0; fi < 2; ++fi) { free(self->card_snd[lv][fi]); } }
+#endif
     free(self->fx_rcap);
+    free(self->ultra);
+    free(self->ultra_send);
     free(self);
 }
 
@@ -761,7 +479,6 @@ instantiate(const LV2_Descriptor* descriptor, double rate,
         return NULL;
     }
     self->sample_rate = rate;
-    self->tol_env_decay = exp(-1.0 / (0.050 * rate * 2.0));   /* the tolerance follower's 50 ms release at fs_hi (2x) */
     self->trim_lin    = 1.0f;
     self->smooth_coef = (float)(1.0 - exp(-1.0 / (0.005 * rate)));
     {   /* the chunk while a pot moves: BN_KNOB_CHUNK_S in samples at this rate, at least 1 */
@@ -779,78 +496,72 @@ instantiate(const LV2_Descriptor* descriptor, double rate,
     self->fx_rcap    = (double*)calloc(BN_MAX_BLOCK, sizeof(double));
     if (!self->buf_in || !self->buf_out || !self->buf_hi
         || !self->fx_ret_lo || !self->fx_ret_hi || !self->fx_send_hi || !self->fx_rcap) {
-        bn_teardown(self);       /* the buffers AND the configs AND the arms: see bn_teardown */
+        bn_teardown(self);       /* the buffers AND the configs: see bn_teardown */
         return NULL;
     }
     self->fx_lvl_now = 1.0;   /* the port's default; the ramp starts from here */
 
-    /* The configurations are built HERE, outside the audio thread. Changing
-     * factor live is just moving a pointer. */
-    /* The neural power stage — the four embedded weight sets, bound (no I/O, no copy),
-     * the activation table built here and never in run(). The net IS the power stage: if any arm
-     * fails to bind, or the arms were trained at different rates, the instance is not created and
-     * the host reports a failed load. Bound BEFORE the configurations: each one's rate converter
-     * needs the nets' rate. */
-    bn_nn_lstm_lut_init();
-    for (int k = 0; k < BN_NN_N_ARMS; ++k) {
-        if (bn_nn_lstm_bind(&self->nn[k], bn_nn_arms[k].blob, bn_nn_arms[k].bytes) != 0
-            || self->nn[k].fs != self->nn[0].fs) {
-            bn_teardown(self);
-            return NULL;
-        }
-    }
-    self->nn_fs = (double)self->nn[0].fs;
-    /* The zero state is NOT the net at rest: from it the net emitted a start-up transient —
-     * 0,32 peak at the output 1,2 ms after activate, tail to ~300 ms, at ANY knob setting, volume 0 included —
-     * and then a DC its blocker had to drain. Each arm is settled HERE (outside the audio thread) on 0,5 s of
-     * silence at the rest rail and the netlist's default knobs; `activate` restores that state, the net's ring
-     * carries its rest output and the DC blocker starts settled on it. Measured rest outputs: UK −0,297 V ·
-     * 50 W −0,433 · US −0,060 · 50 W US +0,276 (they take 0,3-0,7 s of silence to converge). */
-    /* THE NET'S REST STATE IS PRECOMPUTED, NOT RECOMPUTED ON EVERY INSTANCE.
-     * Settling the FOUR arms for 0,5 s each here would be 4 x 48000 steps = 3910 M instructions
-     * = 0,40 s of a 0,417 s instantiation (low-power 4-core x86 CPU, `performance` governor), i.e. 3,5 TIMES what
-     * processing TWO SECONDS of audio costs. And it would run ALWAYS, also in the preamp-only
-     * build, where the net is compiled OUT of run().
-     * The settled state is DETERMINISTIC given the blob, i.e. a generated constant like any
-     * other: `tools/gen_nn_rest.c` emits it by calling the SAME bn_nn_lstm_settle with the same
-     * arguments, so the table is BIT-IDENTICAL to what settling here would produce. Its gate
-     * (`make mk81-nn-rest`) reruns the settle and demands equality, so the table cannot go stale
-     * when a weight set is retrained.
-     * ⛔ It is NOT deferred to first use: that would put 0,1 s INSIDE the audio thread on a variant
-     * switch. It is precomputed, not postponed. */
-    for (int k = 0; k < BN_NN_N_ARMS; ++k) {
-        memcpy(self->nn[k].h_rest, BN_NN_REST_H_TAB[k], sizeof self->nn[k].h_rest);
-        memcpy(self->nn[k].c_rest, BN_NN_REST_C_TAB[k], sizeof self->nn[k].c_rest);
-        self->nn[k].y_rest   = BN_NN_REST_Y_TAB[k];
-        self->nn[k].has_rest = 1;
-    }
+    /* The configurations are built HERE, outside the audio thread. Changing factor live is just moving a pointer. */
     self->os_factor = 0;
-    /* the silence thresholds lever, read ONCE (never on the audio thread). */
-    { const char* e = getenv("BN_QUIET"); self->quiet_rel = (e && e[0] == '0') ? 0 : 1; }
     self->psu_grid = (uint32_t)lround(256.0 * rate / 48000.0);
     if (self->psu_grid < 1) { self->psu_grid = 1; }
-    /* Only the factor the product offers is built: 2x. Each configuration is a whole engine (DK init,
-     * rings, oversamplers), so building one is the instantiate time and memory of one. Every loop over
-     * cfg[] guards on `ready`. */
+    /* the two factors the product offers, 2x and 4x (hq): each configuration is its oversampler, the loop's
+     * resampler pair and complement; every loop over cfg[] guards on `ready` */
     bn_build_cfg(self, 2);
-    /* FACTORY = 2x: 23.9% of a core on average against 40.8% at 4x, within
-     * the target. See the port's comment in the .ttl. 2x is the only factor
-     * built and the only one the port can select. */
-    if (!self->cfg[bn_osi(2)].ready) {   /* should not happen; safety net */
-        bn_teardown(self);       /* the buffers AND the configs AND the arms: see bn_teardown */
+    /* built here, never from run(): the hq switch only moves self->c. Guarded so a measuring copy whose line above
+     * builds 4x builds it once */
+    if (!self->cfg[bn_osi(4)].ready) { bn_build_cfg(self, 4); }
+    if (!self->cfg[bn_osi(2)].ready) {   /* 2x, the default, must exist */
+        bn_teardown(self);       /* the buffers AND the configs: see bn_teardown */
         return NULL;
     }
     self->c = &self->cfg[bn_osi(2)];
     self->os_factor = 2;
-    /* Ramp of the oversampling change: 5 ms down + 5 ms up. At rest
+    /* the latency every factor reports: the largest of the configurations built (a 4x that failed to build is never
+     * selected, so it does not count) */
+    self->lat_max = 0;
+    for (int f = 2; f <= 4; f *= 2) {
+        const BnCfg* cf = &self->cfg[bn_osi(f)];
+        if (cf->ready) { const int l = bn_cfg_lat(cf, f) + bn_fxp_latency(&cf->fxos); if (l > self->lat_max) { self->lat_max = l; } }
+    }
+    if (self->lat_max > BN_PAD_RING - 1) { self->lat_max = BN_PAD_RING - 1; }
+    self->pad_len = 0; self->pad_pos = 0; self->pad_len_on = 0; self->fx_eng_now = 0.0;
+    /* Ramp of the oversampling change: 5 ms down, BN_OS_SETTLE_S muted, 5 ms up. At rest
      * os_gain = 1 and bn_os_ramp does nothing. */
     self->os_phase = 0;
     self->os_want  = 2;
     self->os_primero = 1;
     self->os_gain  = 1.0f;
     self->os_step  = (float)(1.0 / (0.005 * rate));
-    self->nn_arm = 0; self->nn_arm_want = 0; self->nn_hold = 0; self->nn_gain = 1.0;
     self->cond_from_ports = 1;
+    bn_ultra_tables_init();
+    self->ultra = calloc(1, bn_ultra_size());
+    bn_prepig_tables_init();
+    self->ultra_send = calloc(1, bn_prepig_size());
+    self->ultra_card = calloc(1, bn_ultra_size());
+    if (!self->ultra_card) { bn_teardown(self); return NULL; }
+    for (int lv = 0; lv < 2; ++lv) {
+        for (int fi = 0; fi < 2; ++fi) {
+            self->card_ret[lv][fi] = cr_ret_new(rate * (fi ? 4.0 : 2.0), lv);
+            if (!self->card_ret[lv][fi]) { bn_teardown(self); return NULL; }
+#ifdef BN_SEND_TWIN
+            self->card_snd[lv][fi] = cs_send_new(rate * (fi ? 4.0 : 2.0) * BN_SEND_K(fi), lv);
+            if (!self->card_snd[lv][fi]) { bn_teardown(self); return NULL; }
+#endif
+        }
+    }
+#ifdef BN_FXZ_WARM
+    {   /* every card system initialised once here (not real-time), so the tables its init builds once
+         * (MKS_FXZ_TAB) are warm before the loop is first switched on in run() */
+        BnUltraKnobs kw; memset(&kw, 0, sizeof kw); kw.vol = kw.treb = kw.bass = kw.mid = kw.master = kw.pres = 0.5;
+        for (int lv = 0; lv < 2; ++lv) for (int vv = 0; vv < BN_ULTRA_NV; ++vv)
+            (void)bn_ultra_init(self->ultra_card, BN_ULTRA_FX(vv, lv), rate * 2.0, &kw, bn_ultra_vht(vv), bn_ultra_vbias(vv, 0.5));
+    }
+#endif
+    self->card_on = 0; self->card_lv = 1; self->card_send = 0.0; self->card_fxr = 0.0;
+    self->card_g = 0.0; self->card_wait = 0; self->card_fading_out = 0;
+    if (!self->ultra || !self->ultra_send) { bn_teardown(self); return NULL; }
+    self->ultra_v = -1; self->ultra_gain = 1.0;
     return (LV2_Handle)self;
 }
 
@@ -888,24 +599,23 @@ connect_port(LV2_Handle instance, uint32_t port, void* data)
     case BN_FX_MIX:        self->fx_mix        = (const float*)data; break;
     case BN_FX_RETURN_LVL: self->fx_return_lvl = (const float*)data; break;
     case BN_ENGINE:        self->engine        = (const float*)data; break;
+    case BN_HQ:            self->hq            = (const float*)data; break;
+    case BN_FX_LEVEL:      self->fx_level      = (const float*)data; break;
     default: break;
     }
 }
 
-/* Real-time factor CHANGE: move a pointer and nothing else. Every
- * configuration is already built in instantiate, so there is no memory
- * allocation and no solve here (rebuilding from run() measured a 7.8 ms peak
- * on the audio thread). */
-/* the power stage's latency in fs_hi samples (see BnCfg.nnr): the net's rate-converter delay rounded up to a
- * whole host sample; what the declared latency, the power bypass's dry path and the net all align to */
-static int bn_pw_lat(const BnCfg* c, int factor)
+/* a configuration's own latency at the base rate: its oversampler's */
+static int bn_cfg_lat(const BnCfg* c, int factor)
 {
-    const int f = factor > 0 ? factor : 1;
-    int lat = c->nnr.delay > 0 ? ((c->nnr.delay + f - 1) / f) * f : 0;
-    if (lat > BN_PB_RING - 1) { lat = BN_PB_RING - 1; }
-    return lat;
+    (void)factor;
+    const int lat = bn_os_latency(&c->os);
+    return lat < 0 ? 0 : lat;
 }
 
+/* Real-time factor CHANGE: move a pointer and reset the per-configuration
+ * caches. Every configuration is already built in instantiate, so there is no
+ * allocation here; the engine's re-start at the new rate is bn_os_switch's. */
 static void rebuild_oversampler(BritishNoise* self, int factor)
 {
     if (factor == self->os_factor) { return; }
@@ -914,34 +624,23 @@ static void rebuild_oversampler(BritishNoise* self, int factor)
     self->c = &self->cfg[ci];
     /* a cell in progress keeps its rail ramp; its slope is per fs_hi sample */
     if (self->os_factor > 0) {
-        self->dvx_hi  *= (double)self->os_factor / (double)factor;
         self->drq_hi  *= (double)self->os_factor / (double)factor;
     }
     self->os_factor = factor;
-    /* the incoming configuration carries the knobs from the last time it was
-     * used: force them to be reapplied (Woodbury, cheap) */
+    /* force the knobs to be reapplied on the next block */
     self->low_state = -1;
-    self->us_state = -1;
     self->byp_pre_mix = 0.0;   /* starts with the preamp ACTIVE; the ramp leads to the target */
     self->byp_pow_mix = 0.0;   /* likewise the power stage */
     self->fx_mix_now  = 0.0;   /* FX: the loop re-engages (and resets its pair) */
     self->fx_running  = 0;
     for (int k = 0; k < 5; ++k) { self->knobs_last[k] = -1.0f; }
-    /* ⚠️ The PSU is NOT reset here (`bn_psu_init` + `vx_now = BPLUS`): the
-     * supply is NOT state that depends on the oversampling — it is the amp's
-     * rail, and changing a simulation's factor has no reason to switch it off.
-     * Resetting it makes the rail jump to B+ and the amp momentarily louder
-     * until the sag pulls it down again: measured, an OVERSHOOT of 1.31
-     * against 1.14 for the control during ~150 ms after each change. The rail
-     * is carried as is.
-     * `w2_peak_fast` IS reset: it is a per-block peak, not a physical state. */
+    /* ⚠️ The PSU is NOT reset here: the supply does not depend on the
+     * oversampling, and resetting it makes the rail jump to B+ and the amp
+     * momentarily louder until the sag pulls it down again (an overshoot for
+     * ~150 ms after each change). The rail is carried as is.
+     * `w2_peak_fast` IS reset: it is a per-cell peak, not a physical state. */
     self->w2_peak_fast = 0.0;
     self->env_fast = 0.0;
-    /* the incoming config's rings hold what it carried when it was last left: clear them (the os
-     * ramp is at its bottom here). The net's state is at its own rate in every config: kept. */
-    bn_nn_rate_reset(&self->c->nnr);
-    memset(self->c->nn_ring, 0, sizeof self->c->nn_ring);
-    self->c->nn_pos = 0;
 }
 
 /* Advances the oversampling-change ramp and returns the gain to apply.
@@ -1029,20 +728,8 @@ static inline double bn_ctl(const float* port, double def, double lo, double hi)
     return v;
 }
 
-/* THE SILENCE BYPASS THRESHOLDS, TIED TO THE TOLERANCE.
- *
- * WHY. The rest floor is NOT fixed noise: it is the Newton's residual, and it scales LINEARLY with
- * `dk.tol` — measured, `max|dy| = 0,116 x tol`, constant over three decades (tol 1e-4 -> 1,164e-5 ·
- * 1e-5 -> 1,163e-6 · 1e-6 -> 1,164e-7 · 1e-8 -> 5,66e-8). The absolute thresholds were calibrated
- * against a floor of 7,4e-9, so raising the tolerance from 1e-6 to 1e-4 lifts the floor 100x and makes
- * them unreachable: the bypass never engages and a stopped track costs as much as a playing one. An
- * absolute tolerance is not a tolerance; tying the thresholds to `tol` keeps them from going stale
- * whenever the tolerance moves again.
- *
- * ⭐ ON BY DEFAULT (together with tol 3e-5). The factors are the MEASURED ones. With `BN_QUIET=0` the
- * absolute constants come back, so the before and after can be measured on the same machine. */
-/* Every read of a 0..1 control port goes through here: NULL, NaN and Inf read as 0 (a +Inf on `hiss` once poisoned
- * the DK's state for good), the rest is clamped to the TTL range. */
+/* Every read of a 0..1 control port goes through here: NULL, NaN and Inf read as 0 (a +Inf on `hiss` would
+ * poison the circuit's state for good), the rest is clamped to the TTL range. */
 static inline double bn_port01(const float* p)
 {
     if (!p) { return 0.0; }
@@ -1050,36 +737,249 @@ static inline double bn_port01(const float* p)
     if (!isfinite(v)) { return 0.0; }
     return v < 0.0f ? 0.0 : (v > 1.0f ? 1.0 : (double)v);
 }
-static inline double bn_quiet_eps(const BritishNoise* self)
-{   return self->quiet_rel ? 0.5 * self->c->dk.tol : (double)BN_QUIET_EPS;   }
-static inline double bn_quiet_level(const BritishNoise* self)
-{   return self->quiet_rel ? 1.0 * self->c->dk.tol : (double)BN_QUIET_LEVEL; }
-static inline double bn_quiet_xeps(const BritishNoise* self)
-{   return self->quiet_rel ? BN_QUIET_XEPS_K * self->c->dk.tol : (double)BN_QUIET_XEPS;  }
+/* The silence freeze's thresholds, as multiples of one tolerance (BN_QUIET_TOL, volts): the rest floor is the
+ * solver's residual, so thresholds tied to a tolerance follow it where absolute ones would go stale.
+ *   eps   (0.5 tol): the most the output may move per sample and still count as still
+ *   level (1 tol):   the output must also be that small (the freeze never takes a flat but loud signal)
+ *   xeps  (BN_QUIET_XEPS_K tol, relative to the state's magnitude): the most the circuit's state may move */
+#define BN_QUIET_TOL 3e-5
+static inline double bn_quiet_eps(const BritishNoise* self)   { (void)self; return 0.5 * BN_QUIET_TOL; }
+static inline double bn_quiet_level(const BritishNoise* self) { (void)self; return 1.0 * BN_QUIET_TOL; }
+static inline double bn_quiet_xeps(const BritishNoise* self)  { (void)self; return BN_QUIET_XEPS_K * BN_QUIET_TOL; }
 
-static void bn_apply_vars(BritishNoise* self, const float* kn, int low)
+
+
+/* The head port, read only through here: 0 = the 100 W head, 1 = the 50 W head, 2 = the reissue (a 100 W EL34 head
+ * with its own pots, no C2 and its own supply); anything else (NaN included) reads 0. */
+static int bn_head_port(const BritishNoise* self)
 {
-    double pv[BN_PREAMP2203_N_POTS + BN_PREAMP2203_N_JACK];
-    const int us = (self->us_spec && *self->us_spec > 0.5f) ? 1 : 0;   /* US preamp pots */
-    bn_preamp2203_pot_values(kn[0], kn[1], kn[2], kn[3], kn[4], pv, us);
-    const double* jv = low ? BN_PREAMP2203_JACK_LOW : BN_PREAMP2203_JACK_HIGH;
-    for (int k = 0; k < BN_PREAMP2203_N_JACK; ++k) {
-        pv[BN_PREAMP2203_N_POTS + k] = jv[k];
+    if (!self->head) { return 0; }
+    const float h = *self->head;
+    return h > 1.5f ? 2 : h > 0.5f ? 1 : 0;
+}
+/* The engine's variant from the ports, bn_ultra.h's order: 0 = 100 W UK, 1 = 100 W US, 2 = 50 W UK, 3 = 50 W US
+ * (2 x head + us), 4 = the reissue (EL34 whatever the US switch says) */
+static int bn_ultra_want(const BritishNoise* self)
+{
+    if (bn_head_port(self) == 2) { return 4; }
+    return 2 * (bn_head_port(self) == 1 ? 1 : 0) + ((self->us_spec && *self->us_spec > 0.5f) ? 1 : 0);
+}
+
+/* the knobs as applied now: the pots' slewed values, presence and Cabinet Feel, the jack, the rectifier's era */
+static BnUltraKnobs bn_ultra_knobs_now(const BritishNoise* self)
+{
+    BnUltraKnobs k;
+    k.vol = self->knobs_last[0]; k.treb = self->knobs_last[1]; k.bass = self->knobs_last[2];
+    k.mid = self->knobs_last[3]; k.master = self->knobs_last[4];
+    k.pres = self->ultra_pres_now;
+    k.cab = self->ultra_cab_now;
+    k.lowin = self->low_state > 0 ? 1.0 : 0.0;
+    k.era = (self->era_now || self->ri_now) ? 1.0 : 0.0;   /* the rectifier's reservoir inside the engine (the reissue: the old way) */
+    return k;
+}
+
+/* Measurement build only (-DBN_DUMP_SLOW, env BN_ULTRA_BMODE): 7 drives the engine from an IDEAL supply (B+ the
+ * netlist's htraw source value, the bias at rest); 8 the B+ from the rectifier source vsrc; 9 = 8 with the bias at
+ * rest. In the product the three tests are 0. */
+#define BN_B7(self) 0
+#define BN_B8(self) 0
+#define BN_B9(self) 0
+/* The engine's B+ source from the supply as it is now: the rectifier's source vsrc (the systems carry the averaged
+ * rectifier and its reservoir themselves). Used per cell; a start uses it only in the measurement builds
+ * (bmode 5, BN_ULTRA_U1_REPLICA), the product's start takes the rest point (bn_ultra_u1_start). */
+static double bn_ultra_u1_psu(const BritishNoise* self, int v)
+{
+    const double ich = self->psu.vsrc > self->psu.vc23 ? (self->psu.vsrc - self->psu.vc23) / self->psu.rchg : 0.0;
+    /* the systems carry the averaged rectifier (htraw-plates = rchg, C23 on the Era knob), so htraw is its source vsrc;
+     * the replica supply here still serves the bias law and the hum */
+    (void)ich; (void)v;
+    return self->psu.vsrc;
+}
+/* The engine's B+ for its DC solve: the supply's, once the supply runs THIS head; before that (activate() starts the
+ * supply on the 100 W head and the head port is applied on the first supply cell) the head's own pinned rest point
+ * (a 50 W start solved at the 100 W supply's voltage would start far from its operating point) */
+static double bn_ultra_u1_start(const BritishNoise* self, int v)
+{
+    /* The supply runs inside the system, and a DC solve puts its reservoir at REST; a start while the amp plays (the
+     * hq switch, a variant change) would then begin with the sag undone. Solved at vsrc minus the replica's present
+     * sag (idle twin minus loaded), the reservoir starts where the supply is now, and the run continues on vsrc */
+    if (self->psu.w50 == ((v & 2) ? 1 : 0)) { return self->psu.vsrc - (self->psu_idle.vc23 - self->psu.vc23); }
+    const double vr = (v & 2) ? BN_PSU_V_REST * BN_PSU_K_V_50W : BN_PSU_V_REST;
+    const double ir = (v & 2) ? BN_PSU_I_REST * BN_PSU_K_I_50W : BN_PSU_I_REST;
+    /* that head's vsrc: bn_psu_refresh's pinned rest point vr + rchg ir, with the head's (and era's) rchg */
+    const double rc = (v & 2) ? BN_PSU_RCHG_NEW * BN_PSU_K_RCHG_50W
+                    : (self->era_now || v == 4) ? BN_PSU_RCHG_OLD : BN_PSU_RCHG_NEW;
+    return vr + rc * ir;
+}
+/* the send system's knobs: the engine's without the Cabinet Feel (the send system has no output stage) */
+static BnPrepigKnobs bn_prepig_knobs(const BnUltraKnobs* k)
+{
+    const BnPrepigKnobs p = { k->vol, k->treb, k->bass, k->mid, k->master, k->pres, k->lowin };
+    return p;
+}
+static int bn_prepig_knobs_differ(const BnUltraKnobs* a, const BnUltraKnobs* b)
+{
+    return a->vol != b->vol || a->treb != b->treb || a->bass != b->bass || a->mid != b->mid || a->master != b->master
+        || a->pres != b->pres || a->lowin != b->lowin;
+}
+/* The engine's knob set brought up to date (the pots, presence, Cabinet Feel, and the era the supply applies): rebuilt
+ * only when it changed. Called by the pots' slew at a knob cell's edge and by the supply's tick right after it moves the
+ * era (MK81#202: the era reached the engine at the NEXT chunk, whose start was the host block's - -23.5 dBFS at blocks of
+ * 1 / 7 with the era flipped after activate()). */
+static void bn_ultra_sync_knobs(BritishNoise* self)
+{
+    const BnUltraKnobs kq = bn_ultra_knobs_now(self);
+    if (self->ultra_v >= 0 && memcmp(&kq, &self->ultra_kn, sizeof kq) != 0) {
+        bn_ultra_set_knobs(self->ultra, self->ultra_v, &kq);
+        if (self->send_on && bn_prepig_knobs_differ(&kq, &self->send_kn)) {
+            const BnPrepigKnobs pk = bn_prepig_knobs(&kq);
+            bn_prepig_set_knobs(self->ultra_send, self->ultra_v, &pk);
+            self->send_kn = kq;
+        }
+        self->ultra_kn = kq;
     }
-    /* a refused move (singular I + Q·dG, counted in dkvar.n_singular) leaves the states as they were, so the
-     * next block tries again instead of treating the knob as applied */
-    if (bn_dkvar_set(&self->c->dkvar, pv) != 0) { return; }
-    self->low_state = low;
-    self->us_state = us;
+}
+/* The engine starts on variant v from ITS operating point at the present knobs, bias and supply (a DC solve, no
+ * settling: the engine settles in pseudo-time inside its own start), and the send system is built at the same rate and
+ * knobs. Called from activate(), and from run() once
+ * per switch: on a factor change before the oversampled loop, on a variant change at the sample its fade reaches zero. Returns 0, or -1 if a solve failed (ultra_failed set,
+ * ultra_v = -1: the amp stays muted until a later run() retries). */
+static int bn_ultra_start(BritishNoise* self, int v, int settle)
+{
+    const double rail = self->rq_now;
+    const BnUltraKnobs k = bn_ultra_knobs_now(self);
+    const double u1 = BN_B8(self) ? self->psu.vsrc : BN_B7(self) ? bn_ultra_vht(v) : (self->oldb || self->bmode == 2) ? bn_ultra_vht(v) * rail : bn_ultra_u1_start(self, v);
+    const double u2 = (BN_B7(self) || BN_B9(self)) ? bn_ultra_vbias(v, self->bias_now)
+                    : self->oldlaw ? bn_ultra_vbias(v, self->bias_now) * (1.0 - ((v & 2) ? 1.0 : 11.35 / 32.43) * (1.0 - rail))
+                                   : bn_ultra_vbias(v, self->bias_now) * self->bht_z;   /* the bias reservoir where it is now */
+    const double fs_e = self->sample_rate * (double)(self->os_factor > 0 ? self->os_factor : 1);
+    if (bn_ultra_init(self->ultra, v, fs_e, &k, u1, u2) != 0) {
+        self->ultra_failed = 1; self->ultra_v = -1;
+        return -1;
+    }
+    (void)settle;   /* every start settles inside the engine now (bn_ultra_engine.c, nlcore's mks_mna_settle) */
+    {   /* the send system at this rate and these knobs. Its own operating point here only builds it: run() seeds it
+         * from the heard engine the sample the preamp bypass starts acting (bn_prepig_seed) */
+        const BnPrepigKnobs pk = bn_prepig_knobs(&k);
+        if (bn_prepig_init(self->ultra_send, v, fs_e, &pk, u2, bn_ultra_nodes(self->ultra, v)) != 0) {
+            self->ultra_failed = 1; self->ultra_v = -1;
+            return -1;
+        }
+        self->send_kn = k;
+    }
+    self->ultra_kn = k;
+    self->ultra_v = v;
+    bn_ultra_currents(self->ultra, v, &self->urest_ipl, &self->urest_isc);   /* its rest: the bias law's reference */
+    self->psu_urest = self->psu;
+    self->urest_ok = 1;
+    self->send_on = 0;   /* the engine was re-initialised attached; the send system is re-seeded from it if still needed */
+    self->ultra_ipl_acc = 0.0; self->ultra_isc_acc = 0.0; self->ultra_ncur = 0; self->ultra_cur_ok = 0;
+    return 0;
+}
+
+#if defined(BN_SEND_TWIN)
+/* The card's send from its TWIN: the send half alone at BN_SEND_K x the engine rate (the zeners' clamp pulses charge
+ * C8 in less than an engine sample). w2 inside the sample on the parabola through the last three samples; the last
+ * sub-step is the value at this sample. */
+static inline void bn_card_send_twin(BritishNoise* self, int fi, double w2)
+{
+    void* sw = self->card_snd[self->card_lv][fi]; const int k = BN_SEND_K(fi); double y = 0.0;
+    const double w0 = self->card_w2p, d1 = 0.5 * (w2 - self->card_w2pp), d2 = 0.5 * (w2 - 2.0 * w0 + self->card_w2pp);
+    for (int q = 1; q <= k; ++q) { const double u = (double)q / k; y = cs_send_tick(sw, w0 + u * d1 + u * u * d2); }
+    self->card_w2pp = w0; self->card_w2p = w2; self->card_send = y;
+}
+#endif
+
+
+/* The effects card off and forgotten: its system, its return / send halves and the switch's ramps are re-made by the
+ * loop-ON path the next time the loop is on. Called from activate() and on a variant switch (the card system belongs
+ * to the old variant). */
+static void bn_card_drop(BritishNoise* self)
+{
+    self->card_on = 0; self->card_g = 0.0; self->card_fading_out = 0; self->card_wait = 0; self->card_wait0 = 0;
+    self->card_send = 0.0; self->card_fxr = 0.0;
+#ifdef BN_SEND_TWIN
+    self->card_w2p = self->card_w2pp = 0.0;
+#endif
+}
+
+/* Reads no port (the engine port is ignored): 2 while the engine can start, 1 after a start failed in this run(),
+ * which holds bn_os_target at 2x until the next run() retries */
+static int bn_engine_target(const BritishNoise* self)
+{
+    return !self->ultra_failed ? 2 : 1;
+}
+
+/* THE FACTOR the ports ask for: 4x with hq on (>= 0.5), 2x otherwise. A NaN or an unconnected port reads 2x, the
+ * port's default. */
+static int bn_os_target(const BritishNoise* self, int eng)
+{
+    const int hq_on = self->hq && *self->hq >= 0.5f;   /* NaN compares false: 2x, the default */
+    const int f = (eng == 2 && hq_on) ? 4 : 2;
+    /* a configuration that was not built (out of memory at instantiate, or a measuring copy forced to one factor) is
+     * never asked for: the plugin stays where it is */
+    return self->cfg[bn_osi(f)].ready ? f : self->os_factor;
+}
+
+/* A factor change, applied only where the output is SILENT (the os ramp at zero, or the first block of a stream):
+ * the configuration pointer moves (rebuild_oversampler: no allocation) and the engine re-starts at once at the new
+ * rate from its operating point at the present knobs (bn_ultra_start, a DC solve). Always returns 0. */
+static int bn_os_switch(BritishNoise* self, int factor)
+{
+    rebuild_oversampler(self, factor);
+    self->ultra_hold = 0; self->ultra_gain = 1.0;
+    {
+        /* the knobs as activate() starts the engine: the pots' slewed values, or the ports before the first block
+         * has applied any; the jack from its port (rebuild_oversampler has just invalidated low_state) */
+        static const float KD[5] = { 0.7f, 0.5f, 0.5f, 0.5f, 1.0f };
+        const float* const P[5] = { self->vol, self->treble, self->bass, self->middle, self->master };
+        float kl[5];
+        for (int k = 0; k < 5; ++k) {
+            kl[k] = self->knobs_last[k];
+            if (kl[k] < 0.0f) {
+                const float x = P[k] ? *P[k] : KD[k];
+                self->knobs_last[k] = !(x >= 0.0f) ? KD[k] : !(x <= 1.0f) ? 1.0f : x;
+            }
+        }
+        self->low_state = (self->low_input && *self->low_input > 0.5f) ? 1 : 0;
+        (void)bn_ultra_start(self, bn_ultra_want(self), 1);   /* a failure leaves ultra_v < 0: muted, retried by run() */
+        for (int k = 0; k < 5; ++k) { self->knobs_last[k] = kl[k]; }
+        self->low_state = -1;
+    }
+    return 0;   /* a start that failed leaves the amp muted until run() retries it */
+}
+
+/* the latency pad's delay line (see pad_len): the wet output delayed by pad_len base-rate samples with the FX loop
+ * off (or under 50 % mix), by pad_len_on with the return dominant, crossfaded in 10 ms by fx_eng_now; with the loop
+ * off and settled the result is the pad_len tap bit for bit (x + 0.0 * (y - x) = x) */
+static inline double bn_pad_push(BritishNoise* self, double x, int fx_wet, double eng_step)
+{
+    self->pad_ring[self->pad_pos] = x;
+    int r = self->pad_pos - self->pad_len;
+    if (r < 0) { r += BN_PAD_RING; }
+    int r_on = self->pad_pos - self->pad_len_on;
+    if (r_on < 0) { r_on += BN_PAD_RING; }
+    self->pad_pos = (self->pad_pos + 1) & (BN_PAD_RING - 1);
+    bn_ramp_to(&self->fx_eng_now, fx_wet ? 1.0 : 0.0, eng_step);
+    const double a = self->pad_ring[r];
+    return a + self->fx_eng_now * (self->pad_ring[r_on] - a);
 }
 
 static void
 activate(LV2_Handle instance)
 {
     BritishNoise* self = (BritishNoise*)instance;
+    /* the factor from the ports FIRST, so everything below (the oversampler reset, the engine's start at fs_hi)
+     * acts on the configuration that will run. A best guess (lv2.h: control ports are meaningful from run()); a
+     * different answer in the first run() is switched there without a ramp (os_primero). */
+    { const int f = bn_os_target(self, bn_engine_target(self)); if (f != self->os_factor) { rebuild_oversampler(self, f); } }
+    memset(self->pad_ring, 0, sizeof self->pad_ring);
+    self->pad_pos = 0;
+    self->fx_eng_now = 0.0;   /* the loop-pad crossfade starts where the loop does (off, ramping in) */
     self->quiet_run = 0; self->frozen = 0;
     /* the supply grid restarts with the stream */
-    self->psu_phase = 0; self->pk_cell = 0.0; self->dvx_hi = 0.0; self->drq_hi = 0.0; self->rq_cell0 = 1.0;
+    self->psu_phase = 0; self->pk_cell = 0.0; self->drq_hi = 0.0; self->rq_cell0 = 1.0;
+    self->knob_phase = 0;   /* and the pots' grid (MK81#202) */
     self->hiss_rng = 0x9E3779B9u;   /* fixed seed: reproducible */
     self->psu_i_total = 0.213;      /* idle current */
     /* The two envelopes are state too. Without this, after a transport stop the first block
@@ -1090,30 +990,33 @@ activate(LV2_Handle instance)
     /* OLD WAY: it must MATCH the .ttl's lv2:default (1.0), or a host that
      * does not connect the port would sound different from one that connects
      * it with its default. */
-    self->era_now = 1;              /* old way, the catalogue 100 W head */
-    /* ⛔ And it MUST BE APPLIED TO THE PSU HERE; declaring it is not enough.
-     * `bn_psu_init()` leaves `old_way = 0`, and the only place that calls
-     * `bn_psu_set_era()` is behind `if (era_q != self->era_now)`. With the
-     * default at 1, that guard NEVER fires on instantiation ⇒ the plugin would
-     * say old way while the PSU ran new way, and the control would change
-     * NOTHING in the audio (only the hum, which takes another path).
-     * Measured without this: with the hum off, era=0 and era=1 gave
-     * BIT-IDENTICAL output; with the hum on they did differ (x2,000, its known
-     * figure) — so the port arrived and the default was what lied. */
-    /* LIFECYCLE: the supply, the rails, the hum's phase and the power stage are STATE; if they survived a
-     * deactivate/activate, a host that stopped and restarted the transport would get a different render
-     * (measured on 4 s of DI: 0,45-0,56 apart half a second in, both engines). LV2's activate() is where the
-     * instance returns to its initial state. ⛔ This is NOT the reset `rebuild_oversampler` must not do: there the
-     * rail is carried across on purpose (a factor change is not an amp switched off). */
+    /* the head and the era as run() will read them on its first block (MK81#198): a start on the default head / era
+     * while the ports say another made the first block switch the supply and the engine's rectifier mid-start, at a
+     * point that depends on the host's block size (-DBN_START_ON_DEFAULTS: the defaults as before; it was the bloque gate's
+     * arm until 11-Nov-2026, when the era started reaching the engine at the supply's tick (MK81#202) and that start became
+     * block-independent too - kept as a measurement switch, no gate builds it) */
+    const int head_a = bn_head_port(self);
+    self->era_now = head_a == 0 ? (self->era ? *self->era > 0.5f : 1) : 1;   /* run()'s era_q */
+    /* ⛔ And it MUST BE APPLIED TO THE PSU HERE: `bn_psu_init()` leaves the new way, and run() only calls
+     * `bn_psu_set_era()` when the port differs from era_now, so with the default at 1 the supply would run the
+     * new way while the plugin said old. */
+    /* LIFECYCLE: the supply, the rails, the hum's phase, the effects card and the engine are STATE; if they survived
+     * a deactivate/activate, a host that stopped and restarted the transport would get a different render. LV2's
+     * activate() is where the instance returns to its initial state. ⛔ This is NOT the reset `rebuild_oversampler`
+     * must not do: there the rail is carried across on purpose (a factor change is not an amp switched off). */
     bn_psu_init(&self->psu); bn_psu_init(&self->psu_idle);
+    bn_card_drop(self);   /* the effects card restarts with the loop, as on a fresh instance */
     bn_psu_set_era(&self->psu, self->era_now);
     bn_psu_set_era(&self->psu_idle, self->era_now);
-    self->head_now = 0;             /* the 100 W head */
+    self->head_now = head_a == 1;   /* the 50 W head's supply (run()'s head_q) */
+    self->ri_now = head_a == 2;     /* the reissue's supply (run()'s ri_q) */
     bn_psu_set_head(&self->psu, self->head_now); bn_psu_set_head(&self->psu_idle, self->head_now);
-    self->vx_now = BN_PREAMP2203_BPLUS_V; self->vx_cell0 = self->vx_now;
+    if (self->ri_now) { bn_psu_set_ri(&self->psu, 1); bn_psu_set_ri(&self->psu_idle, 1); }
     self->rq_now = 1.0;
+    self->bht_zss = 1.0; self->bht_z = 1.0; self->bht_a = 0.0;   /* the bias reservoir at rest */
+    self->urest_ok = 0; self->u1_now = 0.0;
     self->hum_ph = 0.0;
-    memset(self->x_snap, 0, sizeof(self->x_snap));
+    memset(self->x_snap, 0, sizeof(self->x_snap)); memset(self->q_psu, 0, sizeof(self->q_psu));
     self->quiet_last = 0.0; self->frozen_out = 0.0;
     self->trim_lin  = 1.0f;
     bn_os_reset(&self->c->os);
@@ -1124,45 +1027,19 @@ activate(LV2_Handle instance)
      * rebuild_oversampler). */
     memset(self->dry_ring, 0, sizeof self->dry_ring);
     self->dry_pos = 0;
-    /* RECOVERY: activate() returns EVERY configuration to its operating point,
-     * so a poisoned DK state is cured by deactivate/activate instead of
-     * needing a re-instantiation. It is not a reset to zero: it is the
-     * snapshot instantiate left after the DC init, so the amp comes back warm
-     * and without a transient. It goes here and not in run() because
-     * activate() is not the audio thread. */
+    /* every configuration, not just the one in use (the host may switch factor after a restart): its oversamplers,
+     * the FX loop's pair and complement, and the w2 seam's blocker back to rest */
     for (int ci = 0; ci < 4; ++ci) {
         BnCfg* c = &self->cfg[ci];
-        if (!c->ready || !c->x_dc) { continue; }
-        /* The engine's own numeric reset, not a hand-kept list of its flags: resetting only
-         * have_lu would leave pred_ok and inv_ok set across a transport stop, and with
-         * BN_PRED=1 the first sample after a restart would take a tangent step from the
-         * pre-stop p. `x` is untouched by bn_dk_reset_estado; v/v_prev are restored right after. */
-        bn_dk_reset_estado(&c->dk);
-        memcpy(c->dk.x, c->x_dc, sizeof(double) * (size_t)c->n_x_dc);
-        memcpy(c->dk.v, c->v_dc, sizeof(double) * (size_t)c->n_v_dc);
-        if (c->dk.v_prev) {
-            memcpy(c->dk.v_prev, c->v_dc, sizeof(double) * (size_t)c->n_v_dc);
-        }
-        /* the w2 seam: since the DK returns to its rest point, its blocker
-         * and the dry ring return to theirs; the FX loop's pair goes cold
-         * (it re-engages by itself if the loop is still active) */
+        if (!c->ready) { continue; }
         c->seam_dc_x1 = c->w2_dc;
         c->seam_dc_y1 = 0.0;
-        c->dc_x1 = 0.0;             /* the active configuration's blocker is started on the net's rest below */
-        c->dc_y1 = 0.0;
-        memset(c->pb_ring, 0, sizeof c->pb_ring);
-        c->pb_pos = 0;
-        memset(c->nn_ring, 0, sizeof c->nn_ring);
-        c->nn_pos = 0;
-        bn_nn_rate_reset(&c->nnr);
-        bn_os_reset(&c->os);   /* every configuration, not just the one in use: the host may switch factor after a restart */
-        bn_os_reset(&c->fxos);
+        bn_os_reset(&c->os);
+        bn_fxp_reset(&c->fxos);
         bn_fxc_reset(&c->fxc);
     }
     self->fx_running = 0;
     self->fx_send_gain = 0.0;
-    self->nn_hold = 0;
-    self->tol_env = 0.0; self->tol_fine_on = 0;   /* the tolerance follower restarts where a fresh instance does */
     /* the port ramps and the "last applied" caches are state too: a restart must start them where a fresh
      * instance does, or the first blocks ramp from wherever the previous run left them */
     self->byp_pre_mix = 0.0; self->byp_pow_mix = 0.0;
@@ -1170,44 +1047,38 @@ activate(LV2_Handle instance)
     /* `dry_mix` and the oversampling ramp are state too: a restart must start them where the PORTS say, or the first
      * take begins with 10 ms of the wrong path fading out (raw DI after a stop in bypass; processed signal on an
      * instance created in bypass). Control port contents are not guaranteed meaningful until run() (lv2.h), so the
-     * value read here is a best guess and the first run() overrides it from its own target.
-     * `self->c` and the PSU rail are NOT reset here: that is physical state, and its non-reset is measured. */
+     * value read here is a best guess and the first run() overrides it from its own target. */
     self->dry_mix = ((self->power && *self->power < 0.5f) || (self->bypass && *self->bypass > 0.5f)) ? 1.0 : 0.0;
     self->dry_from_ports = 1;
     self->cond_from_ports = 1;
     self->os_phase = 0; self->os_gain = 1.0f; self->os_want = self->os_factor;
-    self->low_state = -1; self->us_state = -1;
-    /* x_avg/v_avg/avg_ok must be reset here too — the mechanical failure of this list is
-     * forgetting it when a field is added. `avg_ok` is only cleared in run() when the input stops
-     * being zero, so if the transport stops DURING silence it stays at 1 with the average of the
-     * previous operating point; after activate the first chunk is all zeros again, the weight is
-     * 0,10 instead of 1,0 and the new silence's average starts seeded with the pre-stop one —
-     * which may be from another head, other knobs or another os configuration.
-     * ⚠️ HONEST MAGNITUDE, and that is why it is not claimed audible: chunks are cut at the PSU
-     * cell edge (256 base samples), so half a second of silence is ~94 updates and the stale
-     * seed decays to 0,9^94 ~ 5e-5. What this fixes is the INVARIANT; the margin that saves it
-     * otherwise is incidental, not a decision of this code. */
-    memset(self->x_avg, 0, sizeof self->x_avg);
-    memset(self->v_avg, 0, sizeof self->v_avg);
-    self->avg_ok = 0;
+#ifndef BN_OS_PRIMERO_ONCE   /* the gate's negative arm: the start-up switch only after instantiate, as before */
+    /* MK81#202: a restart is a start - the first run() after activate() switches a factor the ports changed WITHOUT the
+     * silent ramp, as the comment at the top of activate() promises; os_primero was set only at instantiate, so a
+     * re-activated stream with hq flipped took the ramp and the 50 ms settle mute (Roadcase's kit: -8.0 dBFS against the
+     * first render, at every block size) */
+    self->os_primero = 1;
+#endif
+    self->low_state = -1;
     for (int k = 0; k < 5; ++k) { self->knobs_last[k] = -1.0f; }
-    for (int k = 0; k < BN_NN_N_ARMS; ++k) { bn_nn_lstm_rest(&self->nn[k]); }   /* the net starts at ITS rest, not at zero state */
-    self->nn_gain = 1.0;
-    /* The ARM is derived here from the PORTS, the same way run() does it. Priming with `nn_arm`
-     * as it happened to be — 0 from instantiate, or the previous session's — while run() picks by
-     * (head, us) would, on the first activation of a session with the head at 50 W, start the ring
-     * with the UK arm's rest while the net emitted the 50 W one: a step that the 7,64 Hz blocker
-     * turns into a decaying thump at the start of every session.
-     * ⛔ `head_now` does NOT serve here: activate forces it to 0 a few lines above. */
-    self->nn_arm = (self->head && *self->head > 0.5f ? 1 : 0)
-                 + 2 * (self->us_spec && *self->us_spec > 0.5f ? 1 : 0);
-    self->nn_arm_want = self->nn_arm;
-    if (self->c) {
-        /* the net from the first sample: its ring and its DC blocker start ON the net's rest output, so
-         * nothing sees a step */
-        const double yr = (double)self->nn[self->nn_arm].y_rest;
-        for (size_t k = 0; k < BN_PB_RING; ++k) { self->c->nn_ring[k] = yr; }
-        self->c->dc_x1 = yr; self->c->dc_y1 = 0.0;
+    /* the engine starts from its operating point at the ports' knobs, with no fade. Control ports are a best guess
+     * here (lv2.h); a different value in the first run() is an ordinary knob move or switch. */
+    self->ultra_gain = 1.0; self->ultra_hold = 0; self->ultra_v = -1; self->send_on = 0;
+    self->ultra_pres_now = bn_ctl(self->presence, 0.0, 0.0, 1.0);
+    self->ultra_cab_now = bn_ctl(self->cab_load, 0.0, 0.0, 1.0);
+    if (!self->ultra_failed) {
+        static const float KD[5] = { 0.7f, 0.5f, 0.5f, 0.5f, 1.0f };
+        const float* const P[5] = { self->vol, self->treble, self->bass, self->middle, self->master };
+        for (int k = 0; k < 5; ++k) {
+            const float x = P[k] ? *P[k] : KD[k];
+            self->knobs_last[k] = !(x >= 0.0f) ? KD[k] : !(x <= 1.0f) ? 1.0f : x;
+        }
+        self->low_state = (self->low_input && *self->low_input > 0.5f) ? 1 : 0;
+        self->bias_now = bn_ctl(self->bias, 0.5, 0.0, 1.0);
+        if (bn_ultra_start(self, bn_ultra_want(self), 1) == 0) {
+        }
+        for (int k = 0; k < 5; ++k) { self->knobs_last[k] = -1.0f; }   /* run()'s first block takes the ports */
+        self->low_state = -1;
     }
 }
 
@@ -1225,7 +1096,7 @@ activate(LV2_Handle instance)
  *
  * WHERE IT ENTERS, and why this CAN go through the real input (unlike the
  * hum): the noise is generated in the input network, i.e. BEFORE the whole
- * circuit. So it is added to buf_in —which is in VOLTS— and the DK solver
+ * circuit. So it is added to buf_in —which is in VOLTS— and the engine
  * amplifies and filters it by itself, with the amp's real response. There is
  * no need to derive the output level: it emerges.
  *
@@ -1233,7 +1104,7 @@ activate(LV2_Handle instance)
  * the grid. The grid is high impedance, so both noise sources arrive whole and
  * their powers add:  R_eq = (Rpickup ∥ 1M) + 68k
  *
- * ⭐ And this is the good part, because it removes the arbitrariness: the 68k
+ * And this removes the arbitrariness: the 68k
  * STOPPER contributes 90% of the noise power, more than the pickup itself. So
  * the choice of pickup barely matters:
  *      single coil  6k -> 5.42 uV      humbucker    8k -> 5.49 uV
@@ -1297,7 +1168,7 @@ bn_hiss_sample(uint32_t* st)
  * balance, and the imbalance is modelled: eps = -0.07, measured.
  *
  * THE THREE PIECES, none of them invented:
- *   · ripple amplitude: MEASURED on the PSU model (`make psu`), 15.7 Vpp at
+ *   · ripple amplitude: MEASURED on the PSU model, 15.7 Vpp at
  *     0.213 A and 41.1 Vpp at 0.633 A -> line Vpp = 2.81 + 60.5*I
  *   · push-pull imbalance: eps = 0.07 (the pair's fit)
  *   · OT ratio: 14.588 plate-to-plate : 8 ohm, from the REAL WINDING of the
@@ -1308,10 +1179,10 @@ bn_hiss_sample(uint32_t* st)
  *   100 Hz 1.0000 · 200 0.3820 · 300 0.1305 · 400 0.0220 · 500 0.0167 · 600 0.0147
  * and the fundamental is 0.3745 of the total Vpp.
  *
- * ⚠️ WHAT THIS IS NOT: the reduced power model is scaled by the INVERTER's
- * rail (srail), so it cannot SEE the plate rail's ripple. This is injected,
- * derived analytically, not emerging from the circuit — so it does NOT
- * intermodulate with the signal as it really would. Declared, not hidden.
+ * ⚠️ WHAT THIS IS NOT: the engine's supply is an averaged model with no
+ * ripple, so the hum is injected at the output, derived analytically, not
+ * emerging from the circuit — it does NOT intermodulate with the signal as it
+ * really would.
  *
  * ⚠️ And the HEATER hum (50 Hz through cathode-heater leakage), the other
  * half of a real amp's hum, is not modelled: it is not on the schematic and
@@ -1319,10 +1190,8 @@ bn_hiss_sample(uint32_t* st)
  *
  * WHERE it is added: AFTER the silence detector, on purpose. If it came in
  * before, the output would never stay still and the silence freeze —which
- * takes the CPU cost to zero— would never engage.
+ * takes the engine's cost to zero— would never engage.
  * ========================================================================== */
-/* M_PI does not exist under -std=c11 without _GNU_SOURCE; same convention as
- * BN_SQRT2. */
 /* THE MAINS FREQUENCY IS NOT A KNOB: it is a property of the REGION, and this
  * plugin already has a region axis — the `us_spec` port (US edition, 6550).
  * So the frequency goes WITH it, and no extra control is added:
@@ -1332,7 +1201,7 @@ bn_hiss_sample(uint32_t* st)
  * full bridge; the BIAS chain's would be at the mains frequency, half wave —
  * but that one was ruled out by measurement.)
  *
- * ⭐ AND IT IS NOT ONLY THE PITCH. With faster mains the reservoir discharges
+ * AND IT IS NOT ONLY THE PITCH. With faster mains the reservoir discharges
  * for less time between peaks, so the ripple is SMALLER. MEASURED on the PSU
  * model:
  *      50 Hz  16.3 Vpp idle / 42.5 at full load
@@ -1345,13 +1214,9 @@ bn_hiss_sample(uint32_t* st)
 #define BN_HUM_F0_US    120.0      /* 2 x 60 Hz */
 #define BN_HUM_US_K     (50.0/60.0)  /* 1/f ripple — measured 0.832, theory 0.833 */
 #define BN_HUM_EPS      0.07       /* push-pull imbalance, measured */
-/* ⭐ Plate-to-plate : 8 ohm ratio. The 14,588 is from the REAL winding of the
- * 100 W head's OT (Zaa 1708 -> sqrt(1708/8) = 14,61). The 50 W head has ~TWICE
- * the Zaa (3,2 k; the netlist models it with Laa 14,1 H against 7,5)
- * ⇒ N = sqrt(3200/8) = 20,00, +37 %. Scaling the 100 W figure gives the same:
- * 14,588 x sqrt(3200/1702,5) = 20,00.
- * It divides the hum, so a wrong OT gives the wrong hum LEVEL on the 50 W
- * head. */
+/* Plate-to-plate : 8 ohm turns ratio, which divides the hum. 100 W head: from
+ * the OT's winding, 14.588 = sqrt(1702.5 / 8) (Zaa 1702.5 ohm). The 50 W
+ * head's OT has about twice the Zaa (3.2 k) ⇒ N = sqrt(3200/8) = 20.0. */
 #define BN_HUM_OT_N     14.588     /* plate-to-plate : 8 ohm, 100 W head's OT winding */
 #define BN_HUM_OT_N_50W 20.000     /* 50 W head: double Zaa */
 #define BN_HUM_FUND     0.3745     /* fundamental peak / total Vpp */
@@ -1363,18 +1228,13 @@ static const double BN_HUM_HARM[6] = { 1.0, 0.3820, 0.1305, 0.0220, 0.0167, 0.01
 static double
 bn_hum_ripple_vpp(double i_total, int w50)
 {
-    /* Each head has its own line: the 50 W head's supply is not the 100 W's
-     * (different secondary, RWIND and reservoir). Measured with the SAME deck
-     * (psu_checks.py --head 50w), the 50 W head ripples 7,3 Vpp idle and 26,4
-     * flat out, where the 100 W line would give 9,4 and 22,5 — i.e. +2,2 dB of
-     * hum idle and −1,4 flat out. A line through each head's two points, with
-     * the current on the plugin's scale (I_REST/I_FULL, and ×K_I_50W on the
-     * 50 W head: 0,1096 / 0,3257 A). The minimum is the idle value.
-     * ⭐ And the SHAPE (harmonics) has no head axis: measured in the four
-     * head×era cases it agrees within 2 % at equal load — it depends on the
-     * conduction angle, i.e. on the LOAD (H2/H1 0,40 idle, 0,32 flat out), and
-     * the single shipped table sits between the two. The old way's ×2 also
-     * holds on the 50 W head (×2,01 idle, ×1,98 flat out). */
+    /* Each head has its own line (the 50 W head's supply has its own
+     * secondary, winding resistance and reservoir): 7.3 Vpp idle and 26.4 flat
+     * out on the 50 W head. A line through each head's two points, with the
+     * current on the plugin's scale (I_REST / I_FULL, x K_I_50W on the 50 W
+     * head: 0.1096 / 0.3257 A); the minimum is the idle value. The harmonic
+     * SHAPE has no head axis: it depends on the load, and the one table
+     * (BN_HUM_HARM) sits between its idle and flat-out shapes. */
     if (w50) {
         const double v = -2.39 + 88.4 * i_total;
         return v < 7.3 ? 7.3 : v;
@@ -1404,18 +1264,16 @@ bn_hum_sample(double vpp, double ph, int w50)
 static void
 run(LV2_Handle instance, uint32_t n_samples)
 {
-    /* FTZ+DAZ while the DSP runs: without -ffast-math (parity), the DK/FIR
-     * states can fall into denormals in silent tails and a denormal costs
-     * ~50x — measured: peaks of 258%% of the budget in silence.
-     * The MXCSR is restored on exit (the host owns its own mode). */
+    /* FTZ+DAZ while the DSP runs: without -ffast-math the engine's and the
+     * FIRs' states can fall into denormals in silent tails, and a denormal
+     * costs ~50x. The MXCSR is restored on exit (the host owns its own mode). */
     BritishNoise* self = (BritishNoise*)instance;
     const float* const in  = self->in;
     float* const       out = self->out;
     /* The pointer check goes BEFORE touching the MXCSR: in the other order
      * this early return would skip the restore and leave FTZ+DAZ SET on the
-     * host's audio thread — measured, 0x1fa0 -> 0x9fe0. From then on every
-     * plugin in the chain silently flushes denormals: a bug that shows up in
-     * ANOTHER plugin and is hellish to track down. */
+     * host's audio thread, and every plugin after it in the chain would
+     * silently flush denormals. */
     if (!in || !out) {
         return;
     }
@@ -1429,24 +1287,22 @@ run(LV2_Handle instance, uint32_t n_samples)
     if (self->os_phase == 2) {
         /* the ramp reached zero on the previous block: switch HERE, outside
          * the sample loop and with the output silent */
-        rebuild_oversampler(self, self->os_want);
-        /* The incoming configuration carries the state it had when it was left
-         * (or its primed rest, the first time), so its first ~50 ms depart from a configuration that ran all along:
-         * measured 15-50 ms after the switch -20,5 dB on first use, -36 dB on reuse. The output stays muted while it
-         * settles, then fades in as before. */
+        (void)bn_os_switch(self, self->os_want);
+        /* The incoming configuration carries the state it had when it was left (or its primed rest, the first
+         * time), so its first ~50 ms depart from a configuration that ran all along: the output stays muted for
+         * BN_OS_SETTLE_S while it settles, then fades in. */
         self->os_hold = (int)(BN_OS_SETTLE_S * self->sample_rate);
         self->os_phase = self->os_hold > 0 ? 4 : 3;
-    } else if (self->oversample) {
-        /* One legal factor: 2x (not on the panel). Whatever the port carries -- a session saved at 4x, 1, 8,
-         * NaN, Inf -- lands on 2 without being parsed. ⛔ No table to index (a table lookup can read past its
-         * end when the table shrinks). */
-        const int want = 2;
+    }
+    else {
+        /* the factor follows the hq port (bn_os_target), through the same silent ramp */
+        const int want = bn_os_target(self, bn_engine_target(self));
         if (want != self->os_factor && self->os_phase == 0) {
             if (self->os_primero) {
-                rebuild_oversampler(self, want);   /* start-up: no ramp */
+                (void)bn_os_switch(self, want);   /* start-up: no ramp */
             } else {
                 self->os_want  = want;
-                self->os_phase = 1;      /* start ramping down; do NOT switch yet */
+                self->os_phase = 1;
             }
         }
     }
@@ -1455,32 +1311,23 @@ run(LV2_Handle instance, uint32_t n_samples)
      * finished) that would skip it and leave the first real change without a
      * ramp. */
     self->os_primero = 0;
-    /* The dry delay line is aligned with what we declare: if the oversampling
-     * factor changes, the latency changes and must be followed. */
+    /* One latency at every factor (the largest): the running configuration's wet output is padded to it, and the
+     * dry delay line is aligned with it */
     {
-        int lat = bn_os_latency(&self->c->os)
-            + bn_pw_lat(self->c, self->os_factor)
-              / (self->os_factor > 0 ? self->os_factor : 1)
-            ;
-        if (lat < 0) { lat = 0; }
-        if (lat > BN_DRY_RING - 1) { lat = BN_DRY_RING - 1; }
-        self->dry_delay = lat;
-    }
-    if (self->latency) {
-        *self->latency = (float)bn_os_latency(&self->c->os)
-            /* the power stage's latency (bn_pw_lat), in base-rate samples */
-            + (float)bn_pw_lat(self->c, self->os_factor)
-              / (float)(self->os_factor > 0 ? self->os_factor : 1)
-            ;
+        int pad = self->lat_max - bn_cfg_lat(self->c, self->os_factor);
+        if (pad < 0) { pad = 0; }
+        if (pad > BN_PAD_RING - 1) { pad = BN_PAD_RING - 1; }
+        self->pad_len = pad;
+        const int pad_on = pad - bn_fxp_latency(&self->c->fxos);   /* the loop supplies its own round trip */
+        self->pad_len_on = pad_on < 0 ? 0 : pad_on;
+        self->dry_delay = self->lat_max < BN_DRY_RING - 1 ? self->lat_max : BN_DRY_RING - 1;
+        if (self->latency) { *self->latency = (float)self->lat_max; }
     }
 
     /* Panel knobs: the TARGET of this cycle; the actual application is slewed
-     * inside the chunk loop (no zipper — a full-scale automation jump is
-     * spread over BN_KNOB_SLEW_S, 240 ms; the Woodbury update costs 0,02 ms per
-     * move — measured on a low-power 4-core x86 CPU with the dense transformation inside,
-     * `bn_test_var` — so re-applying per chunk while moving is cheap). The
-     * state x survives every step; the chord's LU does not (bn_dkvar_set
-     * invalidates it). */
+     * inside the chunk loop (a full-scale jump is spread over BN_KNOB_SLEW_S)
+     * and the engine's matrices are rebuilt once per chunk while a pot moves.
+     * The circuit's state survives every rebuild. */
     float kn_tgt[5];
     kn_tgt[0] = self->vol    ? *self->vol    : 0.7f;
     kn_tgt[1] = self->treble ? *self->treble : 0.5f;
@@ -1488,24 +1335,18 @@ run(LV2_Handle instance, uint32_t n_samples)
     kn_tgt[3] = self->middle ? *self->middle : 0.5f;
     kn_tgt[4] = self->master ? *self->master : 1.0f;
     /* NEGATED comparisons: with the plain form a NaN on a knob survives both
-     * ifs, and on the FIRST run() it reaches bn_apply_vars -> dG NaN -> LU
-     * NaN -> every matrix A..N NaN -> SIGSEGV. Verified. With the negated
-     * form a NaN falls to the knob's default (KN_DEF). */
+     * ifs and reaches the engine's matrices. With the negated form a NaN falls
+     * to the knob's default (KN_DEF). */
     static const float KN_DEF[5] = { 0.7f, 0.5f, 0.5f, 0.5f, 1.0f };
     for (int k = 0; k < 5; ++k) {
         if (!(kn_tgt[k] >= 0.0f))      { kn_tgt[k] = KN_DEF[k]; }
         else if (!(kn_tgt[k] <= 1.0f)) { kn_tgt[k] = 1.0f; }
     }
     const int low_tgt = (self->low_input && *self->low_input > 0.5f) ? 1 : 0;
-    const int us_tgt  = (self->us_spec && *self->us_spec > 0.5f) ? 1 : 0;
     if (self->knobs_last[0] < 0.0f) {          /* first run: no ramp */
         for (int k = 0; k < 5; ++k) { self->knobs_last[k] = kn_tgt[k]; }
-        bn_apply_vars(self, kn_tgt, low_tgt);
-    } else if (low_tgt != self->low_state || us_tgt != self->us_state) {
-        /* the jack and the US edition switch INSTANTLY (Woodbury, 0,06 ms; a
-         * real replug clicks too, and a version change is a different amp) */
-        bn_apply_vars(self, self->knobs_last, low_tgt);
     }
+    self->low_state = low_tgt;                 /* the jack moves at once, as a real replug */
 
     /* --- BYPASS and POWER. They are not the same:
      *   BYPASS  -> pass-through, but the DSP KEEPS RUNNING. The circuit state
@@ -1520,29 +1361,36 @@ run(LV2_Handle instance, uint32_t n_samples)
     const double dry_target = (power_off || bypass_on) ? 1.0 : 0.0;
     if (self->dry_from_ports) { self->dry_mix = dry_target; self->dry_from_ports = 0; }
     /* Continuous controls applied through per-sample ramps, so a step on the port never reaches the audio as a
-     * step: the net's conditioning knobs (a step moves the net's operating point at once, a jump at the output
-     * even in silence; linear ramps at fs_hi, BN_COND_RAMP_S) and the hum's level (a step cuts the hum waveform
-     * mid-cycle; 10 ms at the host rate). Held still, each ramp sits exactly on its port's value. The first
-     * run() after activate() starts them on the ports. */
-    const double nn_pres_tgt = bn_ctl(self->presence, 0.0, 0.0, 1.0);
-    const double nn_bias_tgt = bn_ctl(self->bias, 0.5, 0.0, 1.0);
-    const double nn_cab_tgt  = bn_ctl(self->cab_load, 0.0, 0.0, 1.0);
+     * step: the bias (a step moves the operating point at once; linear at fs_hi, BN_COND_RAMP_S) and the hum's
+     * level (a step cuts the hum waveform mid-cycle; 10 ms at the host rate). Held still, each ramp sits exactly
+     * on its port's value. The first run() after activate() starts them on the ports. */
+    const double bias_tgt    = bn_ctl(self->bias, 0.5, 0.0, 1.0);
     const double hum_tgt     = bn_port01(self->hum);
     if (self->cond_from_ports) {
-        self->nn_pres_now = nn_pres_tgt; self->nn_bias_now = nn_bias_tgt; self->nn_cab_now = nn_cab_tgt;
+        self->bias_now = bias_tgt;
         self->hum_now = hum_tgt;
         self->cond_from_ports = 0;
     }
     const double dry_step = 1.0 / (0.010 * self->sample_rate);
+    /* a start that found no operating point is retried once per run() call (a DC solve: never per sample) */
+    self->ultra_failed = 0;
+    /* presence follows its port at the pots' slew (a presence move rebuilds the engine's matrices, per chunk) */
+    const double ultra_pres_tgt = bn_ctl(self->presence, 0.0, 0.0, 1.0);
+    /* and Cabinet Feel the same way: a move rebuilds the 4x12's R, L and C, per chunk */
+    const double ultra_cab_tgt = bn_ctl(self->cab_load, 0.0, 0.0, 1.0);
     /* --- THE w2 SEAM: power bypass and FX loop. Read ONCE per run.
      * Precedence: POWER > whole BYPASS > half bypasses; the top two act at
      * the base rate on whatever comes out of here, so there is nothing to
      * arbitrate inside the loop. */
     const double byp_pow_tgt = (self->bypass_power && *self->bypass_power > 0.5f) ? 1.0 : 0.0;
     const int    fx_on       = (self->fx_loop && *self->fx_loop > 0.5f);
-    const double fx_mix_tgt  = fx_on ? bn_ctl(self->fx_mix, 100.0, 0.0, 100.0) * 0.01 : 0.0;
+    /* the card's loop is series only: the mix port is not read (kept so saved sessions load). Reading it put a mix
+     * below 50 % on the loop-off latency tap while the card ran in series (-DBN_FX_MIX_PORT: the gate's arm) */
+    const double fx_mix_tgt  = fx_on ? 1.0 : 0.0;
     const double fx_lvl_tgt  = bn_ctl(self->fx_return_lvl, 1.0, 0.0, 2.0);
     float* const fx_send = self->fx_send;
+    const double eng_step = 100.0 / self->sample_rate;   /* = 1 / (10 ms x fs): the latency pad's tap crossfade per sample */
+    const int    fx_wet   = fx_mix_tgt >= 0.5;               /* the return dominates (0 with the loop off) */
 
     /* POWER off and the ramp finished: exit here without touching the DSP.
      * NOTE: it comes BEFORE the processing — and it must restore the MXCSR,
@@ -1551,6 +1399,7 @@ run(LV2_Handle instance, uint32_t n_samples)
         for (uint32_t i = 0; i < n_samples; ++i) {
             const double s = (double)in[i];
             out[i] = (float)bn_dry_push(self, isfinite(s) ? s : 0.0);
+            (void)bn_pad_push(self, 0.0, fx_wet, eng_step);   /* the wet is silent while the plugin is off: the pad carries silence */
         }
         if (fx_send) { memset(fx_send, 0, n_samples * sizeof(float)); }
         self->fx_send_gain = 0.0;
@@ -1589,7 +1438,11 @@ run(LV2_Handle instance, uint32_t n_samples)
             for (int km = 0; km < 5; ++km) {
                 if (fabsf(kn_tgt[km] - self->knobs_last[km]) > 1e-4f) { moving_pre = 1; }
             }
-            if (moving_pre && n > self->knob_chunk) { n = self->knob_chunk; }
+            if (fabs(ultra_pres_tgt - self->ultra_pres_now) > 1e-4 || fabs(ultra_cab_tgt - self->ultra_cab_now) > 1e-4) { moving_pre = 1; }
+            /* MK81#202: the chunk ends on the pots' grid (knob_chunk cells counted from activate), not knob_chunk
+             * samples from wherever the host block began - at host blocks of 1 / 7 / random sizes the staircase's
+             * steps fell elsewhere (Roadcase's kit: -64 dBFS against blocks of 8192) */
+            if (moving_pre && n > self->knob_chunk - self->knob_phase) { n = self->knob_chunk - self->knob_phase; }
         }
         /* a chunk never crosses a supply cell's edge */
         uint32_t cell_len = self->psu_grid;
@@ -1605,41 +1458,58 @@ run(LV2_Handle instance, uint32_t n_samples)
         /* pot slew: full scale in BN_KNOB_SLEW_S (the only source of that time), matrices rebuilt once per
          * chunk while a pot moves */
         {
-            const float step = (float)n / (BN_KNOB_SLEW_S * (float)self->sample_rate);
+            /* MK81#202: the pots step once per knob CELL, at its first sample, by a whole cell's slew, so their
+             * trajectory is the same at every host block size */
+            const int knob_edge = (self->knob_phase == 0);
+            self->knob_phase += n;
+            if (self->knob_phase >= self->knob_chunk) { self->knob_phase %= self->knob_chunk; }
+#ifdef BN_NO_KNOB_GRID   /* the gate's negative arm only: every chunk starts a cell, wherever the host block cut it */
+            self->knob_phase = 0;
+#endif
+            const float step = knob_edge ? (float)self->knob_chunk / (BN_KNOB_SLEW_S * (float)self->sample_rate) : 0.0f;
             int moving = 0;
             for (int km = 0; km < 5; ++km) {
                 const float d2 = kn_tgt[km] - self->knobs_last[km];
                 if (fabsf(d2) > 1e-4f) {
                     moving = 1;
+                    if (!knob_edge) { continue; }
                     if (d2 >  step)      { self->knobs_last[km] += step; }
                     else if (d2 < -step) { self->knobs_last[km] -= step; }
                     else                 { self->knobs_last[km] = kn_tgt[km]; }
                 }
             }
-            if (moving) {
-                bn_apply_vars(self, self->knobs_last, self->low_state);
+            {
+                const double d3 = ultra_pres_tgt - self->ultra_pres_now;
+                if (fabs(d3) > 1e-4) {
+                    moving = 1;
+                    self->ultra_pres_now = d3 > step ? self->ultra_pres_now + step
+                                         : d3 < -step ? self->ultra_pres_now - step : ultra_pres_tgt;
+                }
+                const double d4 = ultra_cab_tgt - self->ultra_cab_now;
+                if (fabs(d4) > 1e-4) {
+                    moving = 1;
+                    self->ultra_cab_now = d4 > step ? self->ultra_cab_now + step
+                                        : d4 < -step ? self->ultra_cab_now - step : ultra_cab_tgt;
+                }
+                bn_ultra_sync_knobs(self);
             }
             knobs_moving = moving;
         }
 
-        /* --- SILENCE BYPASS --------------------------------------------------
-         * MEASURED: without it, with an input of exact zeros the plugin used
-         * 26.1% of the budget at 4x — 62% of what it costs while PLAYING. That
-         * is the engine solving the circuit to produce nothing, on every
-         * stopped track of the session.
+        /* --- SILENCE FREEZE ---------------------------------------------------
+         * With an input of exact zeros the engine would keep solving the
+         * circuit to produce nothing, on every stopped track of a session.
+         * It does not help while playing (a guitar always brings noise): it
+         * makes a track at rest stop costing.
          *
-         * As soon as anything sounds this does not help (a guitar always
-         * brings background noise), so it is NOT the answer to "the plugin
-         * costs a lot while playing": it makes a track at rest stop costing.
-         *
-         * Discipline so the audio does not change: seeing zeros at the input
-         * is not enough, because the amp's tails keep sounding. It only
-         * freezes when (a) the input is EXACT zeros, (b) no knob moves
-         * —moving a knob reconfigures the circuit— and (c) the output has not
-         * moved more than BN_QUIET_EPS for half a second. By then the state is
-         * at its rest point and freezing it is indistinguishable from
-         * computing on. Any non-zero sample unfreezes at once, and the
-         * internal state is intact because it was never touched. */
+         * Seeing zeros at the input is not enough, because the amp's tails
+         * keep sounding. It only freezes when (a) the input is EXACT zeros,
+         * (b) no knob moves and the loop is off, and (c) for half a second the
+         * output and the circuit's state have stayed within the thresholds of
+         * bn_quiet_eps / bn_quiet_level / bn_quiet_xeps. By then the state is
+         * at its rest point and the frozen output (the mean of the chunk's
+         * last min(n, 64) samples) is indistinguishable from computing on. Any non-zero sample
+         * unfreezes at once; the engine's state was never touched. */
         int all_zero = 1;
         for (uint32_t i = 0; i < n; ++i) {
             if (in[done + i] != 0.0f) { all_zero = 0; break; }
@@ -1649,16 +1519,11 @@ run(LV2_Handle instance, uint32_t n_samples)
         if (!all_zero || knobs_moving || fx_on) {
             self->quiet_run = 0;
             self->frozen = 0;
-            self->avg_ok = 0;
         }
         if (self->frozen) {
             /* the trim keeps ramping: the user can move Output during silence */
-            /* And the HUM keeps going too. Without this the hum would cut out
-             * after half a second of silence — i.e. RIGHT when it is most
-             * audible, the worst possible failure for this feature. A real amp
-             * hums precisely when you are not playing.
-             * ⭐ This path is live: the freeze engages on 53,9 % of a silent
-             * run at os 2 and os 4, so the hum is really heard through here. */
+            /* And the HUM keeps going too: without this it would cut out after
+             * half a second of silence, exactly when a real amp's hum is heard. */
             const int hum_us_f = (self->us_spec && *self->us_spec > 0.5f);
             const double hum_k_f = hum_us_f ? BN_HUM_US_K : 1.0;
             const double hum_dph_f = 2.0 * BN_PI
@@ -1673,7 +1538,7 @@ run(LV2_Handle instance, uint32_t n_samples)
                     self->hum_ph += hum_dph_f;
                     if (self->hum_ph > 2.0 * BN_PI) { self->hum_ph -= 2.0 * BN_PI; }
                 }
-                const double wet = y_f * (double)self->trim_lin;
+                const double wet = bn_pad_push(self, y_f * (double)self->trim_lin, fx_wet, eng_step);   /* the latency pad (see the main loop) */
                 /* Sanitise BEFORE pushing into the ring. With dry_mix=0.0
                  * exactly it is not enough for the wet path to be clean:
                  * 0.0*(NaN-wet) = NaN in IEEE-754, so a NaN from the bus would
@@ -1697,31 +1562,34 @@ run(LV2_Handle instance, uint32_t n_samples)
         const double hiss_v = bn_port01(self->hiss);
         const double hiss_a = (hiss_v > 0.0) ? hiss_v * bn_hiss_rms(self->sample_rate) : 0.0;
         for (uint32_t i = 0; i < n; ++i) {
-            /* SANITISED: a NaN/Inf on the bus —put there by any badly behaved
-             * upstream plugin, a corrupt file or a device change— would reach
-             * the index of a LUT: (int)NaN = INT_MIN and SIGSEGV on the audio
-             * thread, i.e. the whole DAW session down. Verified. One compare
-             * per sample at the BASE rate (not oversampled) is unnoticeable. */
+            /* SANITISED: a NaN/Inf on the bus (a badly behaved upstream plugin,
+             * a corrupt file, a device change) would reach the engine's table
+             * lookups as an index: (int)NaN = INT_MIN, a crash on the audio
+             * thread. One compare per sample at the base rate. */
             const double sin_ = (double)in[done + i];
             /* the hiss is added at the input: thermal noise is generated in the amp's input network. */
             self->buf_in[i]  = (isfinite(sin_) ? sin_ : 0.0)
                              + hiss_a * bn_hiss_sample(&self->hiss_rng);
         }
 
-        bn_os_up(&self->c->os, self->buf_in, n, self->buf_hi);
+        { CZ_T0(cz0); bn_os_up(&self->c->os, self->buf_in, n, self->buf_hi); CZ_ADD(cz_up, cz0); }
 
         const size_t n_hi = (size_t)n * (size_t)self->os_factor;
 
         /* FX LOOP: the resampling pair runs while the loop is active or still
          * fading (mix or send with a ramp half way). It is zeroed when the
-         * loop engages: the 10 ms fade covers the halfbands' start-up (47 taps
+         * loop engages: the 10 ms fade covers the pair's start-up (its round trip
          * at fs_hi, < 1 ms). The return is SANITISED on reading, like the
-         * input: a NaN from the bus cannot enter the DK. */
+         * input: a NaN from the bus cannot enter the engine. */
         const int fx_run = fx_on || self->fx_mix_now > 0.0 || self->fx_send_gain > 0.0;
         if (fx_run) {
             if (!self->fx_running) {
-                bn_os_reset(&self->c->fxos);
+                bn_fxp_reset(&self->c->fxos);
+#ifdef BN_FXC_KEEP   /* the complement keeps its delay estimate across loop switches */
+                bn_fxc_rearm(&self->c->fxc);
+#else
                 bn_fxc_reset(&self->c->fxc);
+#endif
                 self->fx_running = 1;
             }
             const float* ret = self->fx_return;
@@ -1730,55 +1598,21 @@ run(LV2_Handle instance, uint32_t n_samples)
                 self->fx_ret_lo[i] = isfinite(r) ? r : 0.0;
                 self->fx_rcap[i] = self->fx_ret_lo[i];
             }
-            bn_os_up(&self->c->fxos, self->fx_ret_lo, n, self->fx_ret_hi);
+            bn_fxp_up(&self->c->fxos, self->fx_ret_lo, n, self->fx_ret_hi);
             bn_fxc_begin(&self->c->fxc);
         } else {
             self->fx_running = 0;
         }
 
-        /* --- The supply sag. The power stage's circuit is not solved here,
-         * but its CONSUMPTION is modelled: a map measured on the oracle
-         * (master level -> mean currents) feeds the PSU at block rate, and the
-         * preamp's B+ (u[1]) breathes accordingly. */
-        /* PSU CURRENT MAP. Generated with tools/gen_psu_map.py from
-         * `bn_bench psumap 192000 full col own`, i.e. with the plugin's own
-         * valve models (the oracle's reference model passes ~12% less current). It is only
-         * reliable with grid current in the pentode: without it the screen
-         * ran away to 0.68 A (~78 W/valve, against an 8 W limit) because
-         * nothing held the grid back. See bn_pentode_own.c. */
-        /* ⭐ ONE MAP PER HEAD AND PER VALVE FAMILY.
-         * Generated with `bn_bench psumap 192000 <variant> vbias=<its own>`.
-         *
-         * ⚠️ `vbias=` IS NOT OPTIONAL: without it, `psumap` uses the header's
-         * default (-40,19 V, the EL34 calibration) for the 6550 too, and then
-         * the 6550 draws 137,9 mA/valve against 41,0 — 3,4x over, some 64 W of
-         * plate against a limit of 42, with spurious differences of 74 %.
-         *
-         * Per HEAD: the 50W/100W ratio is NOT constant — 0,488 idle and 0,462
-         * flat out. A single scale factor cannot reproduce that; a map can.
-         *
-         * Per FAMILY: with each valve set at ITS bias (40 mA/valve), UK and US
-         * draw the same current at the two ENDS of the travel — 0,719 against
-         * 0,720 A flat out on the 100 W head, 0,332 against 0,331 on the 50,
-         * and idle too (0,1643 / 0,1644) — but not in between. Measured over
-         * the WHOLE grid, each variant at its bias:
-         *
-         *   w2      100W UK   100W US    50W UK    50W US
-         *    0       0.1643    0.1644    0.0800    0.0801   <- identical
-         *    2       0.3507    0.3217    0.1948    0.1720   <- 8,3 % and 11,7 %
-         *    5       0.6037    0.6214    0.2885    0.2980   <- and the sign FLIPS
-         *   30       0.7186    0.7199    0.3318    0.3312   <- identical
-         *
-         * ⇒ It is not an offset (a factor would fix that): it is a curve of another SHAPE.
-         * ⭐ And the SCREEN current separates even more: at w2=2, 0,051 against 0,021 — a
-         * factor of 2,4. That is not visible looking only at the plates.
-         *
-         * In audio terms: the sag is `rchg × (I − I_idle)`, so at low-to-mid level the 6550 amp
-         * sags differently from the EL34 one. It is FEEL —how it responds to a light touch—, not
-         * timbre. Small, but not zero.
-         *
-         * ⭐ CONTROL: the four maps are generated by the same tools/gen_psu_map.py pipeline, and
-         * the two UK maps match the UK-only generation exactly ⇒ the UK path stays BIT-IDENTICAL. */
+        /* --- THE SUPPLY. A replica of the amp's supply (bn_psu) steps once per cell, loaded with the output
+         * valves' plate and screen currents: the engine's own, the last closed cell's mean, once one has closed
+         * since its start (ultra_cur_ok); before that, a MAP of those currents against the master-wiper envelope.
+         * Its rectifier source drives the engine's B+ and its rectifier current the bias reservoir; the hum reads
+         * the total DC load (psu_i_total: the output valves' currents plus the preamp's fixed draws).
+         * PSU CURRENT MAP: mean plate (IPL) and screen (ISC) currents in A against w2's peak in V, measured on the
+         * plugin's own valve models, one map per head and valve family, each family at its own bias (40 mA per
+         * valve): the 50 W / 100 W ratio is not constant over w2, and the EL34 and 6550 curves differ in SHAPE
+         * between their identical ends, so neither can be a scale factor. Row 0 is the idle load (psu_idle). */
         static const double MAP_W2[7]  = { 0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0 };
         static const double MAP_IPL_100_UK[7] = { 0.164, 0.351, 0.604, 0.690,
                                                   0.709, 0.715, 0.719 };
@@ -1796,35 +1630,22 @@ run(LV2_Handle instance, uint32_t n_samples)
                                                   0.329, 0.330, 0.331 };
         static const double MAP_ISC_50_US[7]  = { 0.004, 0.013, 0.049, 0.057,
                                                   0.058, 0.059, 0.059 };
-        /* same expression as us_q below; it is not in scope here yet */
-        const int map_us = (self->us_spec && *self->us_spec > 0.5f) ? 1 : 0;
+        /* the US edition: the 6550 maps; the reissue is EL34 whatever the US switch says (its engine variant 4), so
+         * it reads the EL34 rows (-DBN_RI_US_MAP: the gate's arm, the 6550 rows as before) */
+        const int map_us = bn_ultra_want(self) & 1;   /* 1, 3 = US; 4 = the reissue */
         const double* MAP_IPL = self->head_now ? (map_us ? MAP_IPL_50_US  : MAP_IPL_50_UK)
                                                : (map_us ? MAP_IPL_100_US : MAP_IPL_100_UK);
         const double* MAP_ISC = self->head_now ? (map_us ? MAP_ISC_50_US  : MAP_ISC_50_UK)
                                                : (map_us ? MAP_ISC_100_US : MAP_ISC_100_UK);
-        /* Why the map carries the head axis:
-         *  · asking the 50 W head for the 100 W head's current gives a sag of
-         *    118,9 V where ~53,6 is right — more than DOUBLE. And it looks like
-         *    "the expected result" for the smaller head, which is exactly how a
-         *    flattering figure slips in.
-         *  · an axis whose effect lives in a table that does NOT carry that axis
-         *    simply does not exist. That is why the map has both dimensions and
-         *    not a scale factor: the 50W/100W ratio is NOT constant (0,488 idle,
-         *    0,462 flat out). */
         /* the supply ticks once per CELL (see psu_grid in BritishNoise), at its first chunk */
         const int tick = (self->psu_phase == 0);
         const size_t phase_hi = (size_t)self->psu_phase * (size_t)(self->os_factor > 0 ? self->os_factor : 1);
         if (tick) {
         double ipl = MAP_IPL[6], isc = MAP_ISC[6];
         {
-            /* The map is read with the FAST envelope. The valves' current
-             * follows the drive within a cycle: measured on the exact amp, after an abrupt
-             * cut the total current is back at rest within 12 ms (then 25 ms slightly
-             * below it, the grid-blocking choke, and a 40 ms rebound). Fed through this
-             * same bn_psu, those currents put the PI rail's minimum 28 ms after the cut;
-             * the 80 ms envelope kept the map's current up and put it at 200 ms, 1,4 V
-             * deeper (rms error 2,37 V over the 500 ms after the cut; with 5 ms, 0,34 V;
-             * the block peak with no hold, 0,28 V). */
+            /* The map is read with the FAST (5 ms) envelope: the valves' current follows the drive within a
+             * cycle and is back at rest ~12 ms after an abrupt cut, where a slow envelope would hold the map's
+             * current, and the sag, up for far longer. Replaced below by the engine's own currents. */
             const double w = self->w2_peak_fast;
             for (int k2 = 1; k2 < 7; ++k2) {
                 if (w <= MAP_W2[k2]) {
@@ -1836,72 +1657,91 @@ run(LV2_Handle instance, uint32_t n_samples)
                 }
             }
         }
-        const double vx_prev = self->vx_now;
-        /* DC draws, from the FACTORY TABLE of the 100 W master-volume head
-         * (issue 1, 1981): inverter 2.5 mA from ITS rail · V2 (V2a 1.22 +
-         * follower 1.67) 2.9 mA from X · V1a+V1b 0.91 mA from XP. */
+        /* the supply's load is the engine's own output valves, the last closed cell's mean, once one has closed */
+        if (self->ultra_cur_ok) { ipl = self->ultra_ipl; isc = self->ultra_isc; }
+        /* The preamp's DC draws, from the factory voltage table: inverter 2.5 mA
+         * from ITS rail · V2 (V2a 1.22 + follower 1.67) 2.9 mA from X · V1a+V1b
+         * 0.91 mA from XP. */
+        CZ_T0(czp);
         bn_psu_step(&self->psu, (double)cell_len / self->sample_rate,
                     ipl, isc, 0.0025, 0.0029, 0.00091);
         bn_psu_step(&self->psu_idle, (double)cell_len / self->sample_rate,
                     MAP_IPL[0], MAP_ISC[0], 0.0025, 0.0029, 0.00091);
-        /* The ripple implied by THAT current. Kept per block; the hum is
-         * added below, after the silence detector. */
-        /* The era changes the reservoir capacitor. It is only re-applied if
-         * the control has moved — it costs nothing per block. */
+        if (self->urest_ok) {
+            bn_psu_step(&self->psu_urest, (double)cell_len / self->sample_rate,
+                        self->urest_ipl, self->urest_isc, 0.0025, 0.0029, 0.00091);
+        }
+        CZ_ADD(cz_psu, czp);
+        /* The era changes the reservoir capacitor; re-applied only when the port has moved. */
         {
-            const int era_q = (self->era && *self->era > 0.5f);
+            /* the era is the 100 W originals' (their reservoir); the 50 W head and the reissue have one supply, held
+             * at the default (1, the old way) whatever the port says. An unconnected port reads its default too */
+            const int era_q = bn_head_port(self) == 0 ? (self->era ? *self->era > 0.5f : 1) : 1;
             if (era_q != self->era_now) {
                 bn_psu_set_era(&self->psu, era_q);
                 bn_psu_set_era(&self->psu_idle, era_q);
+                bn_psu_set_era(&self->psu_urest, era_q);
                 self->era_now = era_q;
+#ifndef BN_ERA_SYNC_LATE   /* the gate's negative arm: the engine hears the era at the next chunk, as before */
+                bn_ultra_sync_knobs(self);   /* the engine's reservoir moves in the same cell as the supply's (MK81#202) */
+#endif
             }
         }
         self->psu_i_total = ipl + isc + 0.0025 + 0.0029 + 0.00091;
-        /* With half the reservoir the RIPPLE doubles — measured 16.3 -> 34.5
-         * Vpp idle and 42.5 -> 84.5 at full load, i.e. x2.0. The averaged PSU
-         * model does not represent the ripple (it is out of its scope on
-         * purpose), so the factor is applied here. ⇒ the "old way" hums 6 dB
-         * MORE, at no cost. */
+        /* The ripple implied by THAT current, kept per cell; the hum is added after the silence detector. With half
+         * the reservoir the ripple doubles (x2.0 measured, idle and at full load), and the averaged supply model has
+         * no ripple, so the factor is applied here: the old way hums 6 dB more. Only on the 100 W head: the 50 W
+         * head keeps its reservoir in both eras (bn_psu.c). */
         self->hum_vpp = bn_hum_ripple_vpp(self->psu_i_total, self->head_now)
-                      * (self->era_now ? 2.0 : 1.0);
-        /* The neural power stage applies the PREAMP's sag itself: it was trained on w2 from the preamp at
-         * rest supply (the bench's `preamp`) against the full amp under the rail, whose preamp sags through
-         * the netlist's droppers — so the net learned that sag from its rail input. Fed a w2 that had
-         * already sagged here it applied it twice: 4,5-10 dB of worst-frame ANMR on the product gate,
-         * growing with level. So node X is held at REST: the same supply stepped with the idle currents
-         * (psu_idle). The loaded supply still runs: its rectifier current and plates make the net's rail
-         * (rq below) and its current the hum's ripple. The preamp-only build holds it the same way, so its
-         * output is the w2 the product's power stage, FX send and power bypass see.
-         * An arm trained on w2 WITH the exact node X (`xlive` in bn_nn_weights.h, see
-         * gen_nn_blob.py) gets the loaded supply's X instead: its net never learned the preamp's sag. */
-        self->vx_now = bn_nn_arms[self->nn_arm].xlive ? self->psu.vx : self->psu_idle.vx;
+                      * ((self->era_now && !self->head_now) ? 2.0 : 1.0);
         const size_t cell_hi = (size_t)cell_len * (size_t)(self->os_factor > 0 ? self->os_factor : 1);
-        self->vx_cell0 = vx_prev;
-        self->dvx_hi = (self->vx_now - vx_prev) / (double)(cell_hi ? cell_hi : 1);
         {
-            const double rsag = self->head_now ? 48.6 : 25.0;   /* the OLD supply's RSAG: what the shipped nets were trained with; power_*.cir carry the research values of an alternative mains transformer (33.0 / 64.2) */
+            const double rsag = self->head_now ? 48.6 : 25.0;   /* ohm: the RSAG of rq's htraw point (the measurement builds' rail) */
             const double ich  = self->psu.vsrc > self->psu.vc23 ? (self->psu.vsrc - self->psu.vc23) / self->psu.rchg : 0.0;
             const double ichi = self->psu_idle.vsrc > self->psu_idle.vc23 ? (self->psu_idle.vsrc - self->psu_idle.vc23) / self->psu_idle.rchg : 0.0;
             const double rq_prev = self->rq_now;
             self->rq_now = (self->psu.vc23 + rsag * ich) / (self->psu_idle.vc23 + rsag * ichi);
             self->rq_cell0 = rq_prev;
             self->drq_hi = (self->rq_now - rq_prev) / (double)(cell_hi ? cell_hi : 1);
+            /* The bias reservoir's target for this cell: the HT current above the engine's own rest current
+             * (psu_urest), the circuit's g (per variant and era) and its lag coefficient at this fs_hi.
+             * The reissue runs the 100 W UK's law (bv 0; `& 3` keeps the index inside the 4-row tables) at the
+             * old way's supply (be 1). */
+            const int bv = self->ri_now ? 0 : 2 * self->head_now + (bn_ultra_want(self) & 1);
+            const int be = (self->era_now || self->ri_now) ? 1 : 0;
+            const double ichu = (self->urest_ok && !self->oldrest && self->psu_urest.vsrc > self->psu_urest.vc23)
+                                ? (self->psu_urest.vsrc - self->psu_urest.vc23) / self->psu_urest.rchg
+                                : (self->urest_ok && !self->oldrest) ? 0.0 : ichi;
+            self->bht_zss = 1.0 - BN_ULTRA_BIASHT_G[bv & 3][be] * (ich - ichu);
+            self->bht_a = exp(-1.0 / (self->sample_rate * (double)(self->os_factor > 0 ? self->os_factor : 1)
+                                      * BN_ULTRA_BIASHT_TAU[bv & 3][be]));
+            {   /* the B+ the engine's netlist sees at its htraw (bn_ultra_u1_psu), ramped linearly over the cell */
+                const double u1_prev = self->u1_now;
+                self->u1_now = bn_ultra_u1_psu(self, bv);
+                self->u1_cell0 = u1_prev > 0.0 ? u1_prev : self->u1_now;
+                self->du1_hi = (self->u1_now - self->u1_cell0) / (double)(cell_hi ? cell_hi : 1);
+            }
         }
         }   /* tick */
 
         /* The 100 W / 50 W head. The supply follows the head too (switching only the power stage would make
          * the 50 W sag like a 100 W — and the sag is what tells the two apart when playing). */
         {
-            const int head_q = (self->head && *self->head > 0.5f);
+            const int head_q = (bn_head_port(self) == 1);
+            const int ri_q = (bn_head_port(self) == 2);   /* the reissue's supply (the old way's reservoir + its DC loads) */
+            if (ri_q != self->ri_now) {
+                bn_psu_set_ri(&self->psu, ri_q);
+                bn_psu_set_ri(&self->psu_idle, ri_q);
+                bn_psu_set_ri(&self->psu_urest, ri_q);
+                self->ri_now = ri_q;
+            }
             if (head_q != self->head_now) {
                 bn_psu_set_head(&self->psu, head_q);
                 bn_psu_set_head(&self->psu_idle, head_q);
+                bn_psu_set_head(&self->psu_urest, head_q);
                 self->head_now = head_q;
             }
         }
-        /* Which net. The slot follows head and US spec; when it changes, the sample loop fades the
-         * live net out, switches at silence and fades the new one in (see nn_gain). */
-        self->nn_arm_want = (self->head_now ? 1 : 0) + 2 * ((self->us_spec && *self->us_spec > 0.5f) ? 1 : 0);
         /* PREAMP bypass — crossfade w2 <-> input, 10 ms ramp at fs_hi.
          * The preamp KEEPS running (its state stays warm: no click on return). */
         const double byp_pre_tgt = (self->bypass_preamp && *self->bypass_preamp > 0.5f) ? 1.0 : 0.0;
@@ -1910,21 +1750,8 @@ run(LV2_Handle instance, uint32_t n_samples)
         const double seam_step = byp_pre_step;   /* same 10 ms ramp at fs_hi */
         const double cond_step = 1.0 / (BN_COND_RAMP_S * self->sample_rate
                                         * (double)(self->os_factor > 0 ? self->os_factor : 1));
-        /* the power stage's latency (the net's converter delay, rounded up to a host sample: bn_pw_lat): the
-         * power bypass's dry path is delayed by it, the net's output by what its converter does not already
-         * carry */
-        const int pb_delay = bn_pw_lat(self->c, self->os_factor);
-        int nn_delay  = pb_delay - self->c->nnr.delay;
-        if (nn_delay < 0) { nn_delay = 0; }   /* belt for the _Static_assert above: a negative
-                                               * delay would read past the ring, and the fold at
-                                               * the read site only covers the low side */
-        /* Zero-initialised on purpose: both components are assigned on entering the loop (u[0]
-         * from buf_hi, u[1] with `phase_hi + i + 1`). An initialiser like
-         * `vx_cell0 + dvx_hi * phase_hi` would be computed and never used, and would look so much
-         * like the right one that whoever reordered the loop could take it for the correct
-         * initialiser — the difference (`+ i + 1`) is exactly the rail cell's index. */
+        /* u[0]: the oversampled input at this fs_hi sample; u[1] is unused */
         double u[2] = { 0.0, 0.0 };
-        double y[16];
         /* The fast envelope is a PER-SAMPLE peak follower (decay 5 ms at fs_hi), so its DECAY
          * does not depend on the host's block size. The supply reads its maximum over a fixed
          * CELL of the stream, never over the host's block — the block's maximum of a 5 ms
@@ -1936,15 +1763,8 @@ run(LV2_Handle instance, uint32_t n_samples)
         double env_fast = self->env_fast, pk_fast = 0.0;
         for (size_t i = 0; i < n_hi; ++i) {
             u[0] = self->buf_hi[i];
-            u[1] = self->vx_cell0 + self->dvx_hi * (double)(phase_hi + i + 1);
-            {   /* the tolerance follows the SOLVER INPUT level per sample (peak follower at fs_hi, 50 ms release,
-                 * hysteresis 1e-3 / 3.16e-3). Per sample, not per host block, so the output cannot depend on the block size. */
-                const double a = u[0] < 0.0 ? -u[0] : u[0];
-                self->tol_env = a > self->tol_env ? a : self->tol_env * self->tol_env_decay;
-                if (self->tol_env < 1.0e-3) { self->tol_fine_on = 1; } else if (self->tol_env > 3.16e-3) { self->tol_fine_on = 0; }
-                self->c->dk.tol = self->tol_fine_on ? self->tol_fine : self->tol_norm;
-            }
-            bn_dk_process(&self->c->dk, u, y);
+            /* the bias ramp (and its unread presence / Cabinet Feel twins) advance first: the engine reads the bias */
+            bn_ramp_to(&self->bias_now, bias_tgt, cond_step);
             if (self->byp_pre_mix < byp_pre_tgt) {
                 self->byp_pre_mix += byp_pre_step;
                 if (self->byp_pre_mix > byp_pre_tgt) { self->byp_pre_mix = byp_pre_tgt; }
@@ -1952,49 +1772,279 @@ run(LV2_Handle instance, uint32_t n_samples)
                 self->byp_pre_mix -= byp_pre_step;
                 if (self->byp_pre_mix < byp_pre_tgt) { self->byp_pre_mix = byp_pre_tgt; }
             }
-            /* w2 as used by the power stage: preamp (y[0]) faded towards the input (u[0]).
-             * mix=0 ⇒ w2v = y[0] EXACTLY (bit-identical with the bypass off).
-             * The input enters the seam with the SAME level convention as
-             * the FX loop return (x BN_STAGE_GAIN: 1,0 from the host = 60 V
-             * at the wiper): with the preamp AND the power stage bypassed
-             * the output is the input, like the whole-plugin bypass, and with
-             * the same declared latency. */
-            const double w2v = y[0] + self->byp_pre_mix * (u[0] * BN_STAGE_GAIN - y[0]);
-            /* --- THE w2 SEAM -----------------------------------------------
-             * w2ac = DC-free w2 (the seam's own blocker): it is what GOES OUT
-             * through the send and the power bypass's dry path, as in the
-             * preamp-only build. What ENTERS the power stage with the loop in
-             * series is the return plus w2's CONSTANT rest value (w2_dc,
-             * ~1e-9 V: the wiper hangs after the coupling capacitor), so that
-             * its input HPs, primed at that rest value, do not see a step.
-             * ⛔ "What the blocker removes" is NOT let through: measured, a
-             * pole at 7,6 Hz passes the signal 24 dB down at 100 Hz, and in
-             * series with a zero return the output still ran at rms 0,19
-             * against 0,71 — the loop was not an insert loop.
-             * ⚠️ The mixes are written as `x + m*(a - b)`: with m = 0 exactly
-             * they give `x + 0.0 = x` bit for bit, which is what keeps the
-             * shipped path unchanged with the ports at their defaults
-             * (verified: byte-identical). */
-            const double w2ac = w2v - self->c->seam_dc_x1 + self->c->seam_a * self->c->seam_dc_y1;
-            self->c->seam_dc_x1 = w2v;
-            self->c->seam_dc_y1 = w2ac;
-            double w2p = w2v, w2p_ac = w2ac;
+            /* The preamp bypass fades w2 toward the input (u[0]) with the same level convention as the FX return
+             * (x BN_STAGE_GAIN: 1.0 from the host = 60 V at the wiper): with the preamp AND the power stage bypassed
+             * the output is the input, like the whole-plugin bypass, at the same declared latency. */
+            /* the loop's ramps and its return at this sample, ahead of the engine, which takes the return */
+            double ret_g = 0.0;
             if (fx_run) {
                 bn_ramp_to(&self->fx_mix_now, fx_mix_tgt, seam_step);
                 bn_ramp_to(&self->fx_lvl_now, fx_lvl_tgt, 2.0 * seam_step);
-                /* send and return are at PREAMP LEVEL (w2 / BN_STAGE_GAIN),
-                 * like the output of the preamp-only build: the return is
-                 * put back into w2 volts on entry */
+                /* send and return are at PREAMP LEVEL (w2 / BN_STAGE_GAIN): the
+                 * return is put back into w2 volts on entry */
                 /* the return plus what the host could not carry (bn_fx_comp.h): 0 until the estimator
                  * locks on a near-linear effect, exact at unity once it does. The complement takes the
                  * user's return level like the return itself: it is the part of the RETURN the host dropped,
                  * so a return level of 0 must leave the power stage with nothing of the preamp, complement
                  * included. */
                 const double ret_c = self->fx_ret_hi[i] + bn_fxc_sample(&self->c->fxc, i);
-                const double ret_g = ret_c * self->fx_lvl_now * BN_STAGE_GAIN;
+                ret_g = ret_c * self->fx_lvl_now * BN_STAGE_GAIN;
+            }
+            double w2v_u = 0.0, x0_u = 0.0;
+            {
+                /* a head / edition switch runs through silence: fade out over 10 ms, re-start on the new
+                 * variant's operating point (a DC solve), fade back in. If the ports return to the live
+                 * variant before the fade-out ends, the gain simply ramps back up. */
+                const int vw = bn_ultra_want(self);
+                if (vw != self->ultra_v) {
+                    bn_ramp_to(&self->ultra_gain, 0.0, seam_step);
+                    if (self->ultra_gain <= 0.0 && !self->ultra_failed) {
+                        /* no operating point: the amp stays muted (ultra_v < 0) and the start is retried next run() */
+                        if (bn_ultra_start(self, vw, 0) == 0) {
+                            self->ultra_hold = 0;
+                            /* the effects card's system and its memory belong to the OLD variant (the variants differ in
+                             * topology): processing it as the new one stalled the audio thread and burst (+48 dBFS). It
+                             * is dropped; with the loop still on, the ON path below starts the new variant's card from the
+                             * re-started engine, with its wait and crossfade, inside this muted hold */
+                            bn_card_drop(self);
+                        }
+                    }
+                } else if (self->ultra_hold > 0) {
+                    --self->ultra_hold;
+                } else if (self->ultra_gain < 1.0) {
+                    bn_ramp_to(&self->ultra_gain, 1.0, seam_step);
+                }
+                if (self->ultra_v >= 0) {
+                    const int v = self->ultra_v;
+                    /* rq at this sample (measurement laws only); uu1 the B+ source, uu2 the bias source (the bias reservoir
+                     * following the HT load) */
+                    const double rail = self->rq_cell0 + self->drq_hi * (double)(phase_hi + i + 1);
+                    BnUltraTap tap;
+                    const double uu1 = BN_B8(self) ? self->psu.vsrc : BN_B7(self) ? bn_ultra_vht(v) : self->oldb ? bn_ultra_vht(v) * rail
+                                     : self->u1_now > 0.0 ? self->u1_cell0 + self->du1_hi * (double)(phase_hi + i + 1)
+                                                          : bn_ultra_u1_psu(self, v);
+                    self->bht_z = self->bht_zss + (self->bht_z - self->bht_zss) * self->bht_a;   /* the bias reservoir's lag */
+                    const double uu2 = (BN_B7(self) || BN_B9(self)) ? bn_ultra_vbias(v, self->bias_now) : self->oldlaw ? bn_ultra_vbias(v, self->bias_now) * (1.0 - ((v & 2) ? 1.0 : 11.35 / 32.43) * (1.0 - rail))
+                                                    : bn_ultra_vbias(v, self->bias_now) * self->bht_z;
+                    /* THE PREAMP BYPASS (the !card_done path below). While the bypass acts (or fades), the SEND system
+                     * (src/prepig/: the preamp + phase inverter with the output valves' grids conducting, its inverter rail
+                     * and NFB return read from the heard engine's nodes one engine sample late) plays the loop-free wiper,
+                     * and the heard engine's PI, its C9 top detached, gets (1 - bypass) w2 + bypass x input x G, w2 the
+                     * send system's; the PI's current still loads the heard engine's own preamp.
+                     * With the bypass at 0 the attached engine alone runs, byte-identical to no bypass. The send system is
+                     * born the sample the bypass leaves 0: its matrices at the present knobs (rebuilt only if they moved
+                     * since), every node voltage and capacitor history it shares with the heard engine COPIED from it (a
+                     * settled state, no DC solve), then the heard engine is detached. Idle again, the heard engine takes
+                     * the send system's preamp state back and is re-attached. */
+                    /* THE FX LOOP: the reissue's own effects card, series only (fx_mix is not applied). ON: the card
+                     * variant starts at its DC point and its return half is reset; during the wait (card_wait, the card
+                     * still inaudible) the heard engine plays and the send comes from the send twin; at the end of the
+                     * wait the card takes every node and capacitor it shares with the heard engine (bn_card_seed_on) and
+                     * the crossfade starts. OFF: the heard engine takes them back (bn_card_seed_off: exact, the round trip
+                     * is bit-identical). A LEVEL move hands over through the heard engine. The host's return (ret_g: the
+                     * jack voltage, the FX complement covering the host's latency) drives the return half; its output is
+                     * the card system's fourth source. */
+                    const double by = self->byp_pre_mix;
+                    double t8;
+                    double w2_dry = 0.0;
+                    int card_done = 0;
+                    {
+                        /* unconnected or not a number: the default, Pedal (1) */
+                        const int lvl = (self->fx_level && isfinite(*self->fx_level)) ? (*self->fx_level > 0.5f ? 1 : 0) : 1;
+                        const int fi = self->os_factor >= 4 ? 1 : 0;
+                        const double fs_e = self->sample_rate * (double)(self->os_factor > 0 ? self->os_factor : 1);
+                        /* the crossfade's per-sample step */
+                        const double xf_step = 1.0 / (BN_CARD_XF * fs_e);
+                        if (fx_on && (!self->card_on || self->card_fading_out)) {
+                            if (self->card_fading_out) {
+                                /* ON again while the card fades out: it is still running, so it simply fades back in */
+                                self->card_fading_out = 0; self->card_wait = 0;
+                            } else if (bn_ultra_init(self->ultra_card, BN_ULTRA_FX(v, lvl), fs_e, &self->ultra_kn, uu1, uu2) == 0) {
+#ifndef BN_CARD_LATE
+                                bn_card_seed_on(self->ultra_card, self->ultra, v, lvl);
+                                bn_ultra_set_knobs(self->ultra_card, BN_ULTRA_FX(v, lvl), &self->ultra_kn);
+#endif
+                                (void)cr_ret_reset(self->card_ret[lvl][fi]);
+#ifdef BN_SEND_TWIN
+                                (void)cs_send_reset(self->card_snd[lvl][fi]); self->card_w2p = self->card_w2pp = 0.0;
+#endif
+                                self->card_on = 1; self->card_lv = lvl;
+                                self->card_g = 0.0;
+                                /* the wait at ON, in engine samples: the HOST block the return comes back late (a host closes
+                                 * the loop one of its blocks late; the chunk n can be much shorter, cut at a supply cell or
+                                 * while a knob moves), the send's 10 ms ramp, and a margin of 64 base samples */
+                                const double wait_blk = (double)n_samples;
+                                self->card_wait = (long)(wait_blk * self->os_factor + 0.010 * fs_e + 64.0 * self->os_factor);
+#ifdef BN_CARD_MIDFADE
+                                {   /* the crossfade (two engines) is CENTRED on a chunk boundary, so its cost splits evenly over two
+                                     * chunks instead of loading one: lh = half the crossfade in engine samples, modulo the chunk;
+                                     * the extra wait moves the fade's centre onto the next boundary */
+                                    const long nh = (long)n * (self->os_factor > 0 ? self->os_factor : 1);
+                                    const long lh = (long)(0.5 * BN_CARD_XF * fs_e + 0.5) % (nh > 1 ? nh : 1);
+                                    if (nh > 1) { self->card_wait += (((nh - lh) - ((long)i + self->card_wait) % nh) % nh + nh) % nh; }
+                                }
+#endif
+                                self->card_wait0 = self->card_wait;
+                            }
+                        } else if (!fx_on && self->card_on && !self->card_fading_out) {
+                            /* the heard engine takes the card's state and fades in; the card keeps running meanwhile. From a
+                             * card fully in, the fade waits (the card alone, as while ON) until it is centred on a block
+                             * boundary, like the fade at ON; from a fade still in progress it starts at once */
+                            const long nh = (long)n * (self->os_factor > 0 ? self->os_factor : 1);
+                            const long lh = (long)(0.5 * BN_CARD_XF * fs_e + 0.5) % (nh > 1 ? nh : 1);
+                            const long wt = (self->card_g >= 1.0 && nh > 1) ? (((nh - lh) - (long)i % nh) % nh + nh) % nh : 0;
+                            if (self->card_g <= 0.0) {
+                                bn_card_seed_off(self->ultra, self->ultra_card, v, self->card_lv);
+                                bn_ultra_set_knobs(self->ultra, v, &self->ultra_kn);
+                                self->card_on = 0;
+                            } else {
+                                self->card_fading_out = 1; self->card_wait = wt;
+                                if (wt == 0) { bn_card_seed_off(self->ultra, self->ultra_card, v, self->card_lv); bn_ultra_set_knobs(self->ultra, v, &self->ultra_kn); }
+                            }
+                        } else if (self->card_fading_out && self->card_wait > 0) {
+                            /* the fade at OFF waiting for its place: the heard engine is seeded from the card when it starts */
+                            if (--self->card_wait == 0) { bn_card_seed_off(self->ultra, self->ultra_card, v, self->card_lv); bn_ultra_set_knobs(self->ultra, v, &self->ultra_kn); }
+                        } else if (self->card_on && !self->card_fading_out && lvl != self->card_lv) {
+                            bn_card_seed_off(self->ultra, self->ultra_card, v, self->card_lv);
+                            if (bn_ultra_init(self->ultra_card, BN_ULTRA_FX(v, lvl), fs_e, &self->ultra_kn, uu1, uu2) == 0) {
+                                bn_card_seed_on(self->ultra_card, self->ultra, v, lvl);
+                                bn_ultra_set_knobs(self->ultra_card, BN_ULTRA_FX(v, lvl), &self->ultra_kn);
+                                (void)cr_ret_reset(self->card_ret[lvl][fi]);
+#ifdef BN_SEND_TWIN
+                                (void)cs_send_reset(self->card_snd[lvl][fi]); self->card_w2p = self->card_w2pp = 0.0;
+#endif
+                                self->card_lv = lvl;
+                            } else {
+                                bn_ultra_set_knobs(self->ultra, v, &self->ultra_kn);
+                                self->card_on = 0; self->card_g = 0.0;
+                            }
+                        }
+#if defined(BN_CARD_LATE) && defined(BN_SEND_TWIN)
+                        /* while the card is still INAUDIBLE (the wait at ON, card_g 0) the card system does not run: the heard
+                         * engine plays, the send comes from the twin on ITS w2, the return stage warms up on the host's return;
+                         * at the end of the wait the card system is seeded from the heard engine and the crossfade starts (two
+                         * engines for BN_CARD_XF only, not for the whole wait) */
+                        if (self->card_on && !self->card_fading_out && self->card_g <= 0.0 && self->card_wait > 0) {
+                            const double jack = fx_run ? ret_g : 0.0;
+                            self->card_fxr = CARD_RET_TICK(self->card_ret[self->card_lv][fi], jack);
+                            t8 = bn_ultra_process(self->ultra, v, u[0], uu1, uu2, 0.0, &tap);
+                            w2_dry = tap.w2;
+                            bn_card_send_twin(self, fi, tap.w2);
+                            if (--self->card_wait == 0) {
+                                bn_card_seed_on(self->ultra_card, self->ultra, v, self->card_lv);
+                                bn_ultra_set_knobs(self->ultra_card, BN_ULTRA_FX(v, self->card_lv), &self->ultra_kn);
+                            }
+                            card_done = 1;
+                        } else
+#endif
+                        if (self->card_on) {
+                            const double jack = fx_run ? ret_g : 0.0;
+                            const double fxr = CARD_RET_TICK(self->card_ret[self->card_lv][fi], jack);
+                            self->card_fxr = fxr;
+                            { CZ_T0(cz0); t8 = bn_ultra_process(self->ultra_card, BN_ULTRA_FX(v, self->card_lv), u[0], uu1, uu2, fxr, &tap);
+                              CZ_ADD(cz_ultra, cz0); }
+                            w2_dry = tap.w2;
+#if defined(BN_SEND_TWIN)
+                            /* the send from the TWIN, the card's send half alone at BN_SEND_K x the engine rate: the zeners'
+                             * clamp pulses charge C8 in less than an engine sample, where the whole-amp system's own send is
+                             * decided by its Newton's stopping rule. The system keeps its own send half for w2's load. w2
+                             * inside the sample on the parabola through the last three samples; the last sub-step is the
+                             * value at this sample */
+                            bn_card_send_twin(self, fi, tap.w2);
+#else
+                            self->card_send = tap.fxc;
+#endif
+                            card_done = 1;
+                            /* the transition: the heard (loop-free) engine runs too and the output crossfades */
+                            if (self->card_fading_out) {
+                                if (self->card_wait == 0) { self->card_g -= xf_step; }
+                                if (self->card_g <= 0.0) { self->card_g = 0.0; self->card_on = 0; self->card_fading_out = 0; }
+                            } else if (self->card_wait > 0) {
+                                --self->card_wait;
+                            } else if (self->card_g < 1.0) {
+                                self->card_g += xf_step;
+                                if (self->card_g > 1.0) { self->card_g = 1.0; }
+                            }
+                            if (self->card_g < 1.0) {
+                                BnUltraTap th;
+                                const double t8h = bn_ultra_process(self->ultra, v, u[0], uu1, uu2, 0.0, &th);
+                                const double g = 0.5 - 0.5 * cos(3.14159265358979323846 * self->card_g);   /* raised cosine */
+                                t8 = t8h + g * (t8 - t8h);
+                                w2_dry = th.w2 + g * (w2_dry - th.w2);
+                                /* the supply sees the amp that is heard: the plate and screen currents blend the same way */
+                                tap.ipl = th.ipl + g * (tap.ipl - th.ipl); tap.isc = th.isc + g * (tap.isc - th.isc);
+                            }
+                        }
+                    }
+                    if (!card_done) {
+                    /* with the card the loop is series and fx_mix is not applied (fx = 0): once the card has faded out,
+                     * the mix's 10 ms ramp down must not start the send system; only the preamp bypass uses it */
+                    const double fx = 0.0;
+                    const int loop_acts = fx > 0.0 || by > 0.0 || byp_pre_tgt > 0.0;
+                    /* the heard engine's nodes after its LAST sample (only read while the loop acts) */
+                    const double* nv = (loop_acts || self->send_on) ? bn_ultra_nodes(self->ultra, v) : NULL;
+                    if (loop_acts && !self->send_on) {
+                        if (bn_prepig_knobs_differ(&self->ultra_kn, &self->send_kn)) {
+                            const BnPrepigKnobs pk = bn_prepig_knobs(&self->ultra_kn);
+                            bn_prepig_set_knobs(self->ultra_send, v, &pk);
+                            self->send_kn = self->ultra_kn;
+                        }
+                        int nh = 0;
+                        bn_prepig_seed(self->ultra_send, v, nv, bn_ultra_state(self->ultra, v, &nh));
+                        bn_ultra_detach(self->ultra, v, 1);
+                        self->send_on = 1;
+                    } else if (!loop_acts && self->send_on) {
+                        BnUltraArrays ua;
+                        bn_ultra_arrays(self->ultra, v, &ua);
+                        bn_prepig_restore(self->ultra_send, v, ua.V, ua.Vp1, ua.Vp2, ua.h);
+                        bn_ultra_detach(self->ultra, v, 0);   /* C9 hangs from the wiper again: a rebuild, no stale LU */
+                        self->send_on = 0;
+                    }
+                    if (self->send_on) {
+                        { CZ_T0(cz0); w2_dry = bn_prepig_process(self->ultra_send, v, u[0], uu2, nv); CZ_ADD(cz_send, cz0); }
+                        double top = (1.0 - fx) * (w2_dry + by * (u[0] * BN_STAGE_GAIN - w2_dry))
+                                   + fx * (ret_g + self->c->w2_dc);
+                        double xh = u[0];
+                        { CZ_T0(cz0); t8 = bn_ultra_process(self->ultra, v, xh, uu1, uu2, top, &tap); CZ_ADD(cz_ultra, cz0); }
+                    } else {
+                        { CZ_T0(cz0); t8 = bn_ultra_process(self->ultra, v, u[0], uu1, uu2, 0.0, &tap); CZ_ADD(cz_ultra, cz0); }
+                        w2_dry = tap.w2;
+                    }
+                    }
+                    x0_u = self->ultra_gain * t8;
+                    /* the wiper as the seam sees it (the loop-free amp's: the send never depends on the return), the
+                     * preamp bypass fading it to the input */
+                    w2v_u = w2_dry + by * (u[0] * BN_STAGE_GAIN - w2_dry);
+                    self->ultra_ipl_acc += tap.ipl; self->ultra_isc_acc += tap.isc; ++self->ultra_ncur;
+                }
+            }
+            const double w2v = w2v_u;
+            /* --- THE w2 SEAM -----------------------------------------------
+             * w2ac = DC-free w2 (the seam's own blocker): what GOES OUT through
+             * the send (card off) and the power bypass's dry path. w2p is what
+             * drives the power stage and the envelope: with the loop mixed in,
+             * the return plus w2's CONSTANT rest value (w2_dc, ~0 V), never "w2
+             * minus what the blocker removes" (that would leak the dry signal
+             * into a series loop).
+             * ⚠️ The mixes are written as `x + m*(a - b)`: with m = 0 exactly
+             * they give `x + 0.0 = x` bit for bit, so the path is unchanged
+             * with the ports at their defaults. */
+            const double w2ac = w2v - self->c->seam_dc_x1 + self->c->seam_a * self->c->seam_dc_y1;
+            self->c->seam_dc_x1 = w2v;
+            self->c->seam_dc_y1 = w2ac;
+            double w2p = w2v, w2p_ac = w2ac;
+            if (fx_run) {
                 w2p    = w2v  + self->fx_mix_now * ((ret_g + self->c->w2_dc) - w2v);
                 w2p_ac = w2ac + self->fx_mix_now * (ret_g - w2ac);
                 self->fx_send_hi[i] = w2ac * (1.0 / BN_STAGE_GAIN);
+            }
+            /* with the card in the loop the send is the card's send node and the power stage is driven by the card's
+             * return half (series only): the envelope below follows that */
+            if (self->card_on) {
+                self->fx_send_hi[i] = self->card_send * (1.0 / BN_STAGE_GAIN);
+                /* while the switch crossfades, the envelope follows the heard mix of the two drives, as the output does */
+                const double g = self->card_g >= 1.0 ? 1.0 : 0.5 - 0.5 * cos(3.14159265358979323846 * self->card_g);
+                w2p = w2p + g * (self->card_fxr - w2p); w2p_ac = w2p_ac + g * (self->card_fxr - w2p_ac);
             }
             /* the master envelope (PSU map and bias) follows what REALLY
              * drives the power stage: with the loop, the return */
@@ -2002,138 +2052,102 @@ run(LV2_Handle instance, uint32_t n_samples)
             if (env_fast < 1e-9) { env_fast = 0.0; }          /* no denormal tail in silence */
             if (fabs(w2p) > env_fast) { env_fast = fabs(w2p); }
             if (env_fast > pk_fast) { pk_fast = env_fast; }
-            /* The neural power stage, w2 -> t8. The frame y = r·net(w2/r, r, knobs) lives inside
-             * bn_nn_lstm_stage; r is the rail at the netlist's htraw equivalent (rq, per fs_hi sample).
-             *
-             * A variant switch (head or US spec) runs through silence, sample by sample so the result
-             * does not depend on the host's blocks: the live net's output fades to 0 over 10 ms, the slot
-             * switches there and the new net starts from its rest state; the gain then holds at 0 for
-             * the power stage's latency (pb_delay), which is how long the new net's first output takes to
-             * come out of its ring and converter, and fades back in over 10 ms. If the ports return to
-             * the live slot before the fade-out ends, the gain simply ramps back up. In steady state the
-             * gain is exactly 1 and none of this touches the sample. */
-            if (self->nn_arm_want != self->nn_arm) {
-                bn_ramp_to(&self->nn_gain, 0.0, seam_step);
-                if (self->nn_gain <= 0.0) {
-                    self->nn_arm = self->nn_arm_want;
-                    bn_nn_lstm_rest(&self->nn[self->nn_arm]);
-                    bn_nn_rate_reset(&self->c->nnr);
-                    self->nn_hold = pb_delay;
-                }
-            } else if (self->nn_hold > 0) {
-                --self->nn_hold;
-            } else if (self->nn_gain < 1.0) {
-                bn_ramp_to(&self->nn_gain, 1.0, seam_step);
-            }
-            const double nn_rail = self->rq_cell0 + self->drq_hi * (double)(phase_hi + i + 1);
-            bn_ramp_to(&self->nn_pres_now, nn_pres_tgt, cond_step);
-            bn_ramp_to(&self->nn_bias_now, nn_bias_tgt, cond_step);
-            bn_ramp_to(&self->nn_cab_now,  nn_cab_tgt,  cond_step);
-            const float nn_pres = (float)self->nn_pres_now;
-            const float nn_bias = (float)self->nn_bias_now;
-            const float nn_cab  = (float)self->nn_cab_now;
-            const double w2n = bn_nn_guard(w2p, bn_nn_arms[self->nn_arm].xlive);   /* the net never sees more than it was trained on */
-            const double xn_now = self->c->nnr.active
-                ? (double)bn_nn_rate_tick(&self->c->nnr, &self->nn[self->nn_arm], (float)w2n,
-                                    (float)nn_rail, nn_pres, nn_bias, nn_cab,
-                                    (float)(self->nn_arm & 1), (float)((self->nn_arm >> 1) & 1))
-                : (double)bn_nn_lstm_stage(&self->nn[self->nn_arm], (float)w2n,
-                                    (float)nn_rail, nn_pres, nn_bias, nn_cab,
-                                    (float)(self->nn_arm & 1), (float)((self->nn_arm >> 1) & 1));
-            /* the net's output delayed to the power stage's latency (the converter carries its own part) */
-            self->c->nn_ring[self->c->nn_pos] = xn_now;
-            int rn = self->c->nn_pos - nn_delay;
-            if (rn < 0) { rn += BN_PB_RING; }
-            self->c->nn_pos = (self->c->nn_pos + 1) & (BN_PB_RING - 1);
-            const double x0 = self->nn_gain * self->c->nn_ring[rn];
-            const double y0 = x0 - self->c->dc_x1 + self->c->dc_a * self->c->dc_y1;
-            self->c->dc_x1 = x0;
-            self->c->dc_y1 = y0;
+            const double y0 = x0_u;   /* ULTRA's secondary carries no DC: no output blocker */
             const double wet_hi = y0 * (1.0 / BN_POWER_GAIN);
             /* POWER bypass. The power stage KEEPS running (warm state, no
-             * click on return); at the output t8 is faded with w2 delayed by
-             * the power stage's latency and at preamp level. The declared
-             * latency does not change: the delay is inside the dry path. */
-            self->c->pb_ring[self->c->pb_pos] = w2p_ac;
+             * click on return); at the output t8 is faded toward the same
+             * sample's DC-free seam signal at preamp level: w2, or the card's
+             * return once the loop's card has taken over. */
             {
-                int r = self->c->pb_pos - pb_delay;
-                if (r < 0) { r += BN_PB_RING; }
-                self->c->pb_pos = (self->c->pb_pos + 1) & (BN_PB_RING - 1);
-                const double dry_hi = self->c->pb_ring[r] * (1.0 / BN_STAGE_GAIN);
+                const double dry_hi = w2p_ac * (1.0 / BN_STAGE_GAIN);
                 bn_ramp_to(&self->byp_pow_mix, byp_pow_tgt, seam_step);
                 self->buf_hi[i] = wet_hi + self->byp_pow_mix * (dry_hi - wet_hi);
             }
         }
         /* FX LOOP: the send goes down to the host rate and out with its fade */
         if (fx_run) {
-            bn_os_down(&self->c->fxos, self->fx_send_hi, n, self->fx_ret_lo);
+            bn_fxp_down(&self->c->fxos, self->fx_send_hi, n, self->fx_ret_lo);
             bn_fxc_end(&self->c->fxc, self->fx_send_hi, self->fx_ret_lo, self->fx_rcap, n);
         }
 
-        /* The master-wiper envelope the PSU's current map and the bias' grid-current
-         * map read — the per-sample follower above (release 5 ms: shorter than a low-E
-         * period, and the PI rail's dropper RC, 2 s, hides any ripple at the note's rate). */
+        /* The master-wiper envelope the PSU's current map reads — the per-sample follower
+         * above (release 5 ms: shorter than a low-E period). */
         self->env_fast = env_fast;
-        /* the block's MAXIMUM of the follower, not its value at the block's end: on a
-         * sustained tone that is the tone's peak whatever the block. ⚠️ A per-block hold
-         * (80 ms release) is NOT: it decays whenever the new block's peak is a hair below
-         * the held one, so on a steady 220 Hz sine in 4096-sample blocks at 48 kHz it reads
-         * 8,8 / 3,1 / 8,8 / 3,0 V on alternate blocks (exp(-85/80) = 0,34 per decay) and
-         * the map's current flaps 0,67 / 0,45 A with it. */
-        /* the cell's maximum; the supply reads it when the cell closes */
+        /* the cell's MAXIMUM of the follower, not its value at the cell's end: on a
+         * sustained tone that is the tone's peak whatever the block. The supply reads it
+         * when the cell closes, with the engine's mean currents over the cell. */
         if (pk_fast > self->pk_cell) { self->pk_cell = pk_fast; }
         self->psu_phase += n;
         if (self->psu_phase >= cell_len) {
             self->w2_peak_fast = self->pk_cell;
+            if (self->ultra_ncur > 0) {
+                self->ultra_ipl = self->ultra_ipl_acc / (double)self->ultra_ncur;
+                self->ultra_isc = self->ultra_isc_acc / (double)self->ultra_ncur;
+                self->ultra_cur_ok = 1;
+            }
+            self->ultra_ipl_acc = 0.0; self->ultra_isc_acc = 0.0; self->ultra_ncur = 0;
             self->pk_cell = 0.0;
             self->psu_phase = 0;
         }
 
-        bn_os_down(&self->c->os, self->buf_hi, n, self->buf_out);
+        { CZ_T0(cz0); bn_os_down(&self->c->os, self->buf_hi, n, self->buf_out); CZ_ADD(cz_down, cz0); }
 
-        /* has the output gone still? (see the silence bypass above) */
+        /* has the output gone still? (see the silence freeze above) */
         if (all_zero) {
             double dmax = 0.0;
             for (uint32_t i = 0; i < n; ++i) {
                 const double d = fabs(self->buf_out[i] - self->quiet_last);
                 if (d > dmax) { dmax = d; }
                 const double m = fabs(self->buf_out[i]);
-                /* The whole condition is written out; it is bit-identical to
-                 * `if (m > dmax) { dmax = m > BN_QUIET_LEVEL ? 1e300 : dmax; }`.
-                 * ⛔ Do NOT simplify it to a bare `if (m > BN_QUIET_LEVEL)`: that is NOT
-                 * equivalent — with dmax already above BN_QUIET_LEVEL (the `d` line above can
-                 * leave it there) this form does not freeze and the bare one does. */
+                /* ⛔ Do NOT simplify to a bare `if (m > bn_quiet_level())`: that is NOT
+                 * equivalent — with dmax already above the level (the `d` line above can
+                 * leave it there) the two forms differ. */
                 if (m > dmax && m > bn_quiet_level(self)) { dmax = 1e300; }
             }
-            /* and the circuit state? (see BN_QUIET_XEPS) */
-            {
-                const int nx = self->c->dk.n_states < 64 ? self->c->dk.n_states : 64;
+            /* and the circuit state? (see bn_quiet_xeps) */
+            /* the engine's own state (its capacitors' histories, all of them) must be still too, relative to its
+             * magnitude; the freeze keeps the engine's last state untouched */
+            const int ultra_q = self->ultra_v >= 0;
+            if (ultra_q) {
+                int nu = 0;
+                const double* hu = bn_ultra_state(self->ultra, self->ultra_v, &nu);
+                const int nx = nu < BN_QUIET_NX ? nu : BN_QUIET_NX;
                 double dxmax = 0.0, xmax = 1.0;
+#if BN_QUIET_NX >= 96
+                if (nu > BN_QUIET_NX) { dxmax = 1e300; }   /* more states than the watch holds: never still */
+#endif
                 for (int q = 0; q < nx; ++q) {
-                    const double xq = self->c->dk.x[q];
-                    const double d2 = fabs(xq - self->x_snap[q]);
+                    const double d2 = fabs(hu[q] - self->x_snap[q]);
                     if (d2 > dxmax) { dxmax = d2; }
-                    if (fabs(xq) > xmax) { xmax = fabs(xq); }
-                    self->x_snap[q] = xq;
+                    if (fabs(hu[q]) > xmax) { xmax = fabs(hu[q]); }
+                    self->x_snap[q] = hu[q];
                 }
                 if (dxmax > bn_quiet_xeps(self) * xmax) { dmax = 1e300; }
+            } else {
+                dmax = 1e300;   /* no engine running (a start that found no operating point): nothing to freeze */
+            }
+            /* and the supply? The freeze stops the supply replica and the bias reservoir, which a real silence keeps
+             * recovering for seconds: frozen early, the note after the silence starts on a supply that never
+             * recovered. A per-block delta would pass a slow drift, so the supply is compared with ITSELF at the start
+             * of the still run (q_psu, taken when the run starts): over the whole half second it must not have moved
+             * more than BN_QUIET_PSU_K x BN_QUIET_TOL of each state (the bias reservoir likewise). */
+            {
+                const BnPsu* a = &self->psu;
+                const double va[7] = { a->vc23, a->il, a->vc22, a->vpi, a->vx, a->vxp, self->bht_z };
+                if (self->quiet_run == 0) {
+                    for (int q = 0; q < 7; ++q) { self->q_psu[q] = va[q]; }
+                } else {
+                    for (int q = 0; q < 7; ++q) {
+                        const double m = fabs(self->q_psu[q]) > 1.0 ? fabs(self->q_psu[q]) : 1.0;
+                        const double dq = fabs(va[q] - self->q_psu[q]) / (BN_QUIET_PSU_K * BN_QUIET_TOL * m);
+                        if (dq > 1.0) { dmax = 1e300; }
+                    }
+                }
             }
             if (dmax < bn_quiet_eps(self)) {
-                { const int nxq = self->c->dk.n_states < 64 ? self->c->dk.n_states : 64;
-                  const int nvq = self->c->dk.n_nl < 16 ? self->c->dk.n_nl : 16;
-                  const double w = self->avg_ok ? 0.10 : 1.0;   /* ~10 blocks; measured: more buys nothing more */
-                  for (int q = 0; q < nxq; ++q) { self->x_avg[q] += w * (self->c->dk.x[q] - self->x_avg[q]); }
-                  for (int q = 0; q < nvq; ++q) { self->v_avg[q] += w * (self->c->dk.v[q] - self->v_avg[q]); }
-                  self->avg_ok = 1; }
                 self->quiet_run += (int)n;
                 if (self->quiet_run >= (int)(0.5 * self->sample_rate)) {
                     self->frozen = 1;
-                    if (self->avg_ok) {      /* freeze on the AVERAGE, not on the last sample */
-                        const int nxq = self->c->dk.n_states < 64 ? self->c->dk.n_states : 64;
-                        const int nvq = self->c->dk.n_nl < 16 ? self->c->dk.n_nl : 16;
-                        for (int q = 0; q < nxq; ++q) { self->c->dk.x[q] = self->x_avg[q]; }
-                        for (int q = 0; q < nvq; ++q) { self->c->dk.v[q] = self->v_avg[q]; }
-                    }
                     { double acc = 0.0; const uint32_t m0 = n > 64 ? n - 64 : 0; uint32_t cnt = 0;
                       for (uint32_t q = m0; q < n; ++q) { acc += self->buf_out[q]; ++cnt; }
                       self->frozen_out = cnt ? acc / (double)cnt : self->buf_out[n - 1]; }
@@ -2144,8 +2158,7 @@ run(LV2_Handle instance, uint32_t n_samples)
         }
         self->quiet_last = self->buf_out[n - 1];
 
-        /* Mains hum. Out of the path when the control is at 0, the default —
-         * so the default sound does NOT change. */
+        /* Mains hum. Out of the path when the control is at 0, the default. */
         /* the mains follows the edition: UK 50 Hz, USA 60 (see BN_HUM_F0_UK) */
         const int hum_us = (self->us_spec && *self->us_spec > 0.5f);
         const double hum_f0 = hum_us ? BN_HUM_F0_US : BN_HUM_F0_UK;
@@ -2161,7 +2174,9 @@ run(LV2_Handle instance, uint32_t n_samples)
                 self->hum_ph += hum_dph;
                 if (self->hum_ph > 2.0 * BN_PI) { self->hum_ph -= 2.0 * BN_PI; }
             }
-            const double wet = y_amp * (double)self->trim_lin;
+            /* the latency pad delays the WHOLE wet (amp + hum, after the output trim): a 2x path is delayed sample for
+             * sample, trim ramps and hum included, to the largest configuration's latency */
+            const double wet = bn_pad_push(self, y_amp * (double)self->trim_lin, fx_wet, eng_step);
             /* see the note in the frozen loop — 0.0*NaN = NaN, so the dry
              * path must sanitise even when dry_mix is 0. */
             const double s = (double)in[done + i];
@@ -2213,12 +2228,13 @@ extension_data(const char* uri)
     return NULL;
 }
 
+#define BN_RUN_FN run
 static const LV2_Descriptor descriptor = {
     BN_URI,
     instantiate,
     connect_port,
     activate,
-    run,
+    BN_RUN_FN,
     deactivate,
     cleanup,
     extension_data

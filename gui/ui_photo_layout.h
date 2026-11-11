@@ -25,24 +25,30 @@ static const MkStrip MK_BACK_KNOB_LIT[] = {
   { "knob_noise_lit.png", 535, 673, 80, 80, 128, 574.80, 713.22, 27.43 },
   { "knob_bias_lit.png", 694, 673, 80, 80, 128, 734.41, 713.22, 27.43 },
   { "knob_cab_load_lit.png", 799, 673, 80, 80, 128, 839.15, 713.22, 27.43 },
-  { "knob_fx_return_lvl_lit.png", 1159, 673, 80, 80, 128, 1199.26, 713.22, 27.43 },
-  { "knob_fx_mix_lit.png", 1264, 673, 80, 80, 128, 1304.00, 713.22, 27.43 } };
+  { "knob_fx_return_lvl_lit.png", 1159, 673, 80, 80, 128, 1199.26, 713.22, 27.43 } };
 static const MkStrip MK_BACK_KNOB_DARK[] = {
   { "knob_noise_dark.png", 535, 673, 80, 80, 128, 574.80, 713.22, 27.43 },
   { "knob_bias_dark.png", 694, 673, 80, 80, 128, 734.41, 713.22, 27.43 },
   { "knob_cab_load_dark.png", 799, 673, 80, 80, 128, 839.15, 713.22, 27.43 },
-  { "knob_fx_return_lvl_dark.png", 1159, 673, 80, 80, 128, 1199.26, 713.22, 27.43 },
-  { "knob_fx_mix_dark.png", 1264, 673, 80, 80, 128, 1304.00, 713.22, 27.43 } };
+  { "knob_fx_return_lvl_dark.png", 1159, 673, 80, 80, 128, 1199.26, 713.22, 27.43 } };
 static const MkStrip MK_TOGGLE[] = {
   { "toggle_bypass.png", 225, 675, 74, 75, 2, 261.64, 712.07, 32.36 },
   { "toggle_bypass_preamp.png", 315, 675, 73, 75, 2, 351.51, 712.07, 32.36 },
   { "toggle_bypass_power.png", 404, 675, 74, 75, 2, 441.13, 712.07, 32.36 },
   { "toggle_era.png", 618, 675, 74, 75, 2, 655.22, 712.07, 32.36 },
-  { "toggle_fx_loop.png", 924, 675, 74, 75, 2, 960.92, 712.07, 32.36 } };
+  { "toggle_fx_loop.png", 924, 675, 74, 75, 2, 960.92, 712.07, 32.36 },
+  { "toggle_fx_level.png", 1267, 675, 73, 75, 2, 1303.46, 712.07, 32.36 } };
 static const MkStrip MK_ROCKER = { "rocker_power.png", 201, 692, 108, 108, 5, 254.95, 745.75, 49.70 };
+/* 8-Nov-2026 (the owner): the HQ letters under the badge, frame 0 released / 1 pressed, with the badge lit / dark;
+ * the back's LEVEL corner (frame 0 power on / 1 off: the FX MIX knob's place, now the LEVEL toggle) under the toggles;
+ * the Era bat at its centre, one frame, drawn while the switch is inert (the 50 W head, the reissue: MK81#177) */
+static const MkStrip MK_HQ_LIT = { "hq_lit.png", 937, 548, 126, 101, 2, 1000.00, 598.50, 80.74 };
+static const MkStrip MK_HQ_DARK = { "hq_dark.png", 937, 548, 126, 101, 2, 1000.00, 598.50, 80.74 };
+static const MkStrip MK_BACK_LEVEL = { "back_level.png", 1248, 654, 110, 170, 2, 1303.00, 739.00, 101.24 };
+static const MkStrip MK_TOGGLE_ERA_C = { "toggle_era_c.png", 618, 675, 74, 75, 1, 655.22, 712.07, 32.36 };
 #define MK_N_FRONT_KNOB 7
-#define MK_N_BACK_KNOB 5
-#define MK_N_TOGGLE 5
+#define MK_N_BACK_KNOB 4
+#define MK_N_TOGGLE 6
 static const double MK_KNOB_TRAVEL_DEG = 300.0;
 typedef struct { double x, y, r; } MkCircle;
 typedef struct { double x0, y0, x1, y1; } MkBox;
@@ -51,6 +57,7 @@ static const MkCircle MK_JACK_LOW = { 1554.10, 772.89, 21.37 };
 static const MkBox MK_LED = { 359.73, 723.49, 606.64, 767.88 };
 static const MkBox MK_LED_BEZEL = { 354.81, 718.18, 611.82, 772.76 };
 static const MkBox MK_ROCKER_BOX = { 213.47, 696.05, 296.44, 795.45 };
+static const MkBox MK_HQ_BOX = { 955.44, 566.41, 1044.56, 630.27 };
 static const MkBox MK_FLIP_FRONT = { 145.33, 291.26, 1854.67, 667.07 };
 static const MkBox MK_FLIP_BACK = { 155.19, 261.68, 1844.82, 618.79 };
 /* MK_FLIP_*: the ONLY zones that turn the head round: the grille cloth on the front, the vent on the back */
@@ -68,7 +75,6 @@ static const MkPatch MK_BACK_LABEL[] = {
   { "label_noise.png", 546, 769, 63, 54, 552.14, 775.16, 602.34, 816.49 },
   { "label_bias.png", 716, 769, 41, 27, 722.22, 775.16, 750.62, 789.33 },
   { "label_cab_load.png", 808, 769, 65, 54, 814.08, 775.16, 866.85, 816.34 },
-  { "label_fx_return_lvl.png", 1167, 769, 62, 54, 1173.84, 775.28, 1222.10, 816.34 },
-  { "label_fx_mix.png", 1285, 769, 35, 54, 1291.10, 775.28, 1313.82, 816.34 } };
+  { "label_fx_return_lvl.png", 1167, 769, 62, 54, 1173.84, 775.28, 1222.10, 816.34 } };
 #define MK_FRONT_LABEL_PX 23.57   /* the names' font size in asset px (label_mm x px/mm) */
 #define MK_BACK_LABEL_PX 27.43

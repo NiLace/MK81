@@ -45,24 +45,11 @@ static inline double sigmoid_c(double x, double c)
 
 /* REVERSE-CONDUCTION BLOCK.
  *
- * Measured reach of the vak < 0 region: with `drive` swept over its whole
- * -24..+36 dB travel, the converged margin falls to +0.873 V at full drive,
- * and on the 50 W head the converged state CROSSES (1-2 samples in 2.3 M per
- * model). A probe counting EVERY evaluation also sees Newton's rejected trial
- * points (up to 199 mA of impossible current); those never reach the output,
- * which is why the converged-state probe exists.
- *
- * Measured effect of the block: an A/B on all EIGHT models at maximum drive
- * nulls at -112.8 to -139.0 dB. It is not a sound improvement — it is cheap
- * insurance and solver robustness: Newton stops evaluating the impossible
- * 199 mA in its trials. Its cost is unmeasurable (+0.64 % paired median with
- * the sign flipping in 10 of 21 pairs, i.e. the noise floor).
- *
- * ⚠️ IT REMAINS A PER-MODEL CHECK: `make mk81-probe-vak-modelos`
- * (harness/probe_vak_sweep.sh) sweeps head x family x era x the
- * drive extremes, carries its own positive control and looks at the CONVERGED
- * state, not at every evaluation. `make mk81-probe-vak` is the single-point run.
- * The probe costs ZERO without -DBN_PROBE_VAK.
+ * The converged state rarely reaches vak < 0 (a few samples in millions, on
+ * the 50 W head at full drive), but Newton's trial points do, where the
+ * ungated model would put up to ~200 mA of impossible current. The block is
+ * solver robustness, not a change of sound: with and without it the output
+ * nulls below -110 dB, at no measurable cost.
  *
  * PHYSICS: an anode below the cathode does NOT collect electrons, so the PLATE
  * current vanishes. The grid current does not: what the grid draws is still
@@ -147,15 +134,11 @@ void bn_tube_own(const double* v, double* i, double* J, void* user)
     J[2] = (dik - dig) * gb;  J[3] = (dik / MU) * gb + (ik - ig) * dgb + GMIN;
 }
 
-/* 12AX7 pair EXPERIMENT (BN_TRIMS hook): spread between stages as a current
- * scale within the datasheet spread (±20% gm).
- * trims[t]=1.0 by default => BIT-EXACT with the untrimmed path.
- *
- * ⚠️ It is declared HERE, above every device function, so that both the
- * tabulated and the closed-form paths read it. Declared lower down, only the
- * tabulated paths would see it and the closed-form ones would ignore
- * BN_TRIMS silently: a sweep run with `bn_bench ... tab=0` would measure
- * "the trims do nothing" without any warning. */
+/* Per-stage current trims (lab build only, -DBN_TRIMS_LEVER: the BN_TRIMS
+ * environment variable), a spread between stages within the 12AX7 datasheet's
+ * ±20 % of gm. trims[t] = 1.0 by default => BIT-EXACT with the untrimmed path.
+ * Declared above every device function so the tabulated and the closed-form
+ * paths both read it. */
 static double bn_own_trims[4] = { 1.0, 1.0, 1.0, 1.0 };
 static int    bn_own_trims_read = 0;
 
@@ -163,35 +146,6 @@ static void bn_own_trims_init(void)
 {
     if (bn_own_trims_read) { return; }
     bn_own_trims_read = 1;
-    const char* e = getenv("BN_TRIMS");
-    if (!e) { return; }
-    /* Both the return value and the range are checked, because a bare sscanf
-     * has two ways to poison a measurement SILENTLY:
-     *   · a locale with a decimal COMMA (es_ES, and the host may have called
-     *     setlocale): "1.05,0.95,..." stops reading at the point, sscanf
-     *     returns 1 and the other three trims are left half-set;
-     *   · an absurd value (0, negative, 5.0) gets in as is and the sweep
-     *     measures something else without warning.
-     * The spread experiment lives within the 12AX7 datasheet spread (+-20% of
-     * gm), so outside [0.8, 1.2] it is not a trim: it is a typing error. The
-     * WHOLE vector is rejected with a warning. */
-    double t[4] = { 1.0, 1.0, 1.0, 1.0 };
-    const int n = sscanf(e, "%lf,%lf,%lf,%lf", &t[0], &t[1], &t[2], &t[3]);
-    if (n != 4) {
-        fprintf(stderr, "BN_TRIMS: expected 4 comma-separated values and "
-                        "read %d ('%s'). IGNORED (mind the locale: a decimal "
-                        "point is needed).\n", n, e);
-        return;
-    }
-    for (int k = 0; k < 4; ++k) {
-        if (!(t[k] >= 0.8 && t[k] <= 1.2)) {      /* negated: catches NaN */
-            fprintf(stderr, "BN_TRIMS: value %d is %g, outside [0.8, 1.2] "
-                            "(the 12AX7 datasheet spread). The WHOLE vector "
-                            "is IGNORED.\n", k + 1, t[k]);
-            return;
-        }
-    }
-    for (int k = 0; k < 4; ++k) { bn_own_trims[k] = t[k]; }
 }
 
 int bn_own_trims_puestos(void)
@@ -203,9 +157,8 @@ int bn_own_trims_puestos(void)
     return 0;
 }
 
-/* Four triodes over 8 ports. Like bn_tube_ayumi_tab_x4: it does NOT re-zero
- * the whole 8x8 — it only writes its 2x2 blocks (the rest is already 0 and
- * does not change). */
+/* Four triodes over 8 ports. It does NOT re-zero the whole 8x8: it only
+ * writes its 2x2 blocks (the rest is already 0 and does not change). */
 void bn_tube_own_x4(const double* v, double* i, double* J, void* user)
 {
     (void)user;
@@ -239,11 +192,10 @@ void bn_tube_own_currents_x4(const double* v, double* i, void* user)
 }
 
 /* ------------------------------------------------- TABULATED variant ------
- * The closed form costs ~4 transcendentals per triode and eval (measured:
- * preamp 4x 6.0 µs vs 2.96 with the oracle's reference table). The own model is 1-D
- * twice: Ik(x) with x = Va/µ + Vg, and Ig(vgk). Two LUTs with tabulated
- * derivative, linear interpolation, and the closed form out of range.
- * tools/bn_test_tube_own.c measures the table-vs-closed-form parity. */
+ * The closed form costs ~4 transcendentals per triode and evaluation. The
+ * model is 1-D twice: Ik(x) with x = Va/µ + Vg, and Ig(vgk). Two LUTs with
+ * tabulated derivative, linear interpolation, and the closed form out of
+ * range. tools/bn_test_tube_own.c checks the table-vs-closed-form parity. */
 
 #define BN_OWN_N 32768   /* 8k gives 6e-5 at the knee; 32k brings it to 3e-6 */
 static double bn_own_ik[BN_OWN_N], bn_own_dik[BN_OWN_N];
@@ -280,10 +232,9 @@ static inline double lut1(const double* t, double u0, double u1, double u)
 
 /* BELOW the range the currents are negligible constants (softplus in
  * underflow: ik(−12)≈2e-11 A, ig(−4)≈IG0): the input is CLAMPED to the table
- * edge instead of falling back to the closed form — profiling showed that deep
- * cut-off (grids at −20..−60 V, normal in the preamp) would trigger the closed
- * form in ~3 evals/sample and eat the table's gain. The clamp error stays
- * under the table-vs-closed-form parity gate (bn_test_tube_own).
+ * edge instead of falling back to the closed form, since deep cut-off (grids
+ * at −20..−60 V, normal in the preamp) is common and would eat the table's
+ * gain. The clamp error stays under the parity test's bar (bn_test_tube_own).
  * ABOVE the range (x>16, vgk>12: only extreme abuse) the closed form is used. */
 void bn_tube_own_tab(const double* v, double* i, double* J, void* user)
 {
@@ -329,18 +280,12 @@ void bn_tube_own_tab_currents(const double* v, double* i)
     VAK_PROBE(vak, i[1]);
 }
 
-/* VARIANTS WITHOUT TRIMS. BN_TRIMS is an EXPERIMENT hook —spread between the
- * valves of the pair— that is not set in normal use, but checking it would be
- * paid on the device's HOTTEST path: a call to bn_own_trims_init() and four
- * `g != 1.0` comparisons per evaluation, and the device is evaluated several
- * times per oversampled sample.
- *   The pointer is chosen ONCE when the circuit is built (bn_tube_own_pick_*),
- *   not per sample. With the trims unset —the normal case— the trimmed branch
- *   does nothing, so these variants are BYTE-IDENTICAL by construction: they
- *   only drop code that executes nothing.
- *   ⚠️ Whoever switches the device MUST switch its bench too, or it will
- *   measure a function the plugin no longer runs. See
- *   tools/bn_bench.c. */
+/* VARIANTS WITHOUT TRIMS. Checking the trims would be paid on the device's
+ * HOTTEST path (a call and four comparisons per evaluation, several
+ * evaluations per oversampled sample), so the pointer is chosen ONCE when the
+ * circuit is built (bn_tube_own_pick_*). With the trims unset these variants
+ * are output-identical by construction: they only drop code that executes
+ * nothing. Whoever switches the device must switch tools/bn_bench.c too. */
 void bn_tube_own_tab_x4_notrim(const double* v, double* i, double* J, void* user)
 {
     (void)user;

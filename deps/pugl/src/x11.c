@@ -612,6 +612,13 @@ puglRealize(PuglView* const view)
   attr.event_mask |= StructureNotifyMask;
   attr.event_mask |= VisibilityChangeMask;
 
+  // MK 81 patch (MK81#142, the Roadcase cold audit B2): a border pixel of our own, so that a parent of another
+  // depth (a host's 32-bit container) is not a BadMatch; CopyFromParent is only valid at the parent's depth.
+  // MK81_PUGL_NO_BORDER_PIXEL=1 drops it, for the gate's negative arm only (make mk81-ui-x11depth).
+#ifndef MK81_PUGL_NO_BORDER_PIXEL
+  attr.border_pixel = 0;
+#endif
+
   // Calculate the initial window frame
   const PuglArea  initialSize = puglGetInitialSize(view);
   const PuglPoint initialPos  = puglGetInitialPosition(view, initialSize);
@@ -627,7 +634,11 @@ puglRealize(PuglView* const view)
                             impl->vi->depth,
                             InputOutput,
                             impl->vi->visual,
+#ifndef MK81_PUGL_NO_BORDER_PIXEL
+                            CWColormap | CWEventMask | CWBorderPixel,
+#else
                             CWColormap | CWEventMask,
+#endif
                             &attr);
 
   // Create the backend drawing context/surface

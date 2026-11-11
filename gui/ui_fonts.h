@@ -19,8 +19,8 @@ typedef enum {
 extern cairo_font_face_t *bn_face[BNF_COUNT];
 
 /* Loads the TTFs from <dir> and takes a reference. Returns 1 if a reference was acquired
- * (the caller MUST pair it with exactly one bn_fonts_free), 0 only if FreeType could not
- * initialise. Per-font failures leave that bn_face[] NULL (fallback).
+ * (the caller MUST pair it with exactly one bn_fonts_free), 0 only for a NULL <dir>. Per-font
+ * failures (FreeType or the file) leave that bn_face[] NULL (fallback).
  * Reference-counted across instances. */
 int  bn_fonts_load(const char *dir);
 void bn_fonts_free(void);

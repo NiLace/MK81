@@ -3,9 +3,9 @@
 /* bn_fx_comp.h — the FX loop's complementary path: what the host cannot carry comes back inside the plugin.
  *
  * The effects loop runs at the host's rate, so the part of the seam signal above the host's Nyquist never returns
- * (measured on the shipped preamp: -44.6 dB of w2's energy, and it moves the neural power stage by
- * -42.7 dB of null). This module keeps a model of the host round trip — the same
- * halfband pair, down then up, with no effect in between — and the complement
+ * (small, about -45 dB of w2's energy, but the power stage hears it). This module keeps a model of the host round
+ * trip — the same resampler pair the loop runs (bn_fx_pair.h, the build's arm), down then up, with no effect in
+ * between — and the complement
  *
  *     c[t] = send[t - L] - up(down(send))[t]
  *
@@ -13,7 +13,7 @@
  * effect is transparent: return + c = send delayed by L + D, for ANY L (L only decides where c's energy sits; the
  * measured group delay of the pair puts it above the host's band).
  *
- * D is not known to a plugin, and a misaligned complement is worse than none (+2.7..+3.9 ANMR against +0.2), so D is
+ * D is not known to a plugin, and a misaligned complement is worse than none, so D is
  * ESTIMATED from the host-rate send and return: a coarse normalised cross-correlation on a 16x boxcar decimation
  * (lags 0..BN_FXC_DMAX), then a fine one at the host rate around the coarse peak. The complement is engaged only
  * while the return correlates with the send at D (rho >= 0.9: the effect is close to linear), scaled by the fitted
@@ -25,7 +25,7 @@
 #define BN_FX_COMP_H
 #include <stddef.h>
 #include <stdint.h>
-#include "bn_oversample.h"
+#include "bn_fx_pair.h"
 
 #define BN_FXC_DMAX    4096     /* longest host loop delay searched, in host samples (85 ms at 48 kHz) */
 #define BN_FXC_DEC     16       /* coarse search decimation */
@@ -34,7 +34,7 @@
 
 typedef struct {
     int           factor, L;            /* oversampling factor; the pair's round trip at fs_hi (measured) */
-    BnOversampler os;                   /* the model of the host round trip */
+    BnFxPair      os;                   /* the model of the host round trip: the SAME pair as the plugin's (bn_fx_pair.h) */
     double       *lo, *m;               /* scratch: down(send) (n), up(down(send)) (n*factor) */
     double       *sd;  size_t sd_mask;  uint64_t sd_w;   /* send at fs_hi, to delay it by L */
     double       *c;   size_t c_mask;   uint64_t c_w;    /* the complement at fs_hi, absolute index c_w */
@@ -46,6 +46,12 @@ typedef struct {
     double        acc_c[BN_FXC_NCOARSE], er_c, es_c;
     double        acc_f[BN_FXC_NFINE], es_f[BN_FXC_NFINE], er_f; int d0;
     int           D;                    /* locked host delay (host samples) */
+#ifdef BN_FXC_KEEP
+    int           had_lock;             /* -DBN_FXC_KEEP: a delay was locked since bn_fxc_reset */
+#endif
+#ifdef BN_FXC_CONFIRM
+    int           cand_D;               /* -DBN_FXC_CONFIRM: the last fine window's best delay, -1 = none */
+#endif
     double        g;                    /* fitted return/send gain at D */
     double        srs, srr, sss, a_mon; /* monitor: exponential sums at D */
     double        rho;                  /* last monitored correlation */
@@ -58,6 +64,11 @@ typedef struct {
 int  bn_fxc_init(BnFxComp* x, int factor, size_t max_block, double fs_host);
 void bn_fxc_free(BnFxComp* x);
 void bn_fxc_reset(BnFxComp* x);          /* not RT-heavy: clears state and rings (memset) */
+#ifdef BN_FXC_KEEP
+/* -DBN_FXC_KEEP (the product sets it): the loop engages again - rings cleared as bn_fxc_reset, but a delay locked
+ * before is kept and engaged at once; the monitor drops it (rho < 0.8) if the host or the effect changed meanwhile */
+void bn_fxc_rearm(BnFxComp* x);
+#endif
 
 /* Call once per chunk BEFORE the per-sample loop: marks where this chunk starts in the complement ring. */
 static inline void bn_fxc_begin(BnFxComp* x) { x->base = x->c_w; }

@@ -5,7 +5,7 @@ static const MkText MK_TEXTS[] = {
   { 0, "in", "In", "Guitar input." },
   { 1, "out", "Out", "Amp output." },
   { 2, "trim", "Output", "Output level after the amp: sets its loudness in the mix without changing its tone." },
-  { 3, "oversample", "Oversampling", "Internal oversampling of the amp model (fixed at 2x)." },
+  { 3, "oversample", "Oversampling", "Kept for older sessions and ignored: the oversampling is set by HQ (2x or 4x)." },
   { 4, "preamp_vol", "Preamp Volume", "Preamp gain: from clean through crunch to full saturation." },
   { 5, "treble", "Treble", "High frequencies of the tone stack." },
   { 6, "middle", "Middle", "Midrange of the tone stack." },
@@ -22,17 +22,98 @@ static const MkText MK_TEXTS[] = {
   { 17, "hum", "Mains Hum", "The mains hum of a real amp (1 = as loud as the original)." },
   { 18, "hiss", "Hiss", "The background hiss of a real amp (1 = as loud as the original)." },
   { 19, "era", "Era (old way)", "The power supply of the early (1976) or late (1988) production." },
-  { 20, "head", "Head (100W / 50W)", "100 W head with four power valves, or 50 W with two, which breaks up earlier." },
+  { 20, "head", "Head (100W / 50W / 100W RI)", "100 W head with four power valves, 50 W with two (breaks up earlier), or the 100 W reissue." },
   { 21, "bypass_preamp", "Preamp Bypass", "Bypasses the preamp: the guitar goes straight into the power amp." },
   { 22, "bypass_power", "Power Bypass", "Bypasses the power amp: you hear the preamp alone." },
   { 23, "fx_loop", "FX Loop", "Switches on the effects loop between the preamp and the power amp." },
   { 24, "fx_send", "FX Send", "Effects loop send: the preamp's signal, out to an external effect." },
   { 25, "fx_return", "FX Return", "Effects loop return: the effect's signal, back into the power amp." },
-  { 26, "fx_mix", "FX Mix", "How much of the effects return reaches the power amp: 100 % in series, less in parallel." },
+  { 26, "fx_mix", "FX Mix", "Ignored: the effects loop is series only. Kept so saved sessions load." },
   { 27, "fx_return_lvl", "FX Return Level", "Level of the effects return before it reaches the power amp." },
-  { 28, "engine", "Engine", "Internal engine selector (fixed)." },
+  { 28, "engine", "Engine", "The amp's engine (fixed: the whole amp solved as one circuit). Kept so saved sessions load." },
+  { 29, "hq", "High Quality", "High quality: the Ultra engine at 4x oversampling (off = 2x, the default), about 1.5-1.7 times the CPU." },
+  { 30, "fx_level", "FX Loop Level", "FX loop level: Line = hot send (about a third of the master signal), Pedal = guitar-level send." },
 };
-#define MK_N_TEXTS 29
+#define MK_N_TEXTS 31
+/* each control port's range and default, as the TTL declares them */
+#define MK_LO_trim -24.0
+#define MK_HI_trim 12.0
+#define MK_DEF_trim 0.0
+#define MK_LO_oversample 1.0
+#define MK_HI_oversample 4.0
+#define MK_DEF_oversample 2.0
+#define MK_LO_preamp_vol 0.0
+#define MK_HI_preamp_vol 1.0
+#define MK_DEF_preamp_vol 0.7
+#define MK_LO_treble 0.0
+#define MK_HI_treble 1.0
+#define MK_DEF_treble 0.5
+#define MK_LO_middle 0.0
+#define MK_HI_middle 1.0
+#define MK_DEF_middle 0.5
+#define MK_LO_bass 0.0
+#define MK_HI_bass 1.0
+#define MK_DEF_bass 0.5
+#define MK_LO_master 0.0
+#define MK_HI_master 1.0
+#define MK_DEF_master 1.0
+#define MK_LO_bias 0.0
+#define MK_HI_bias 1.0
+#define MK_DEF_bias 0.5
+#define MK_LO_us_spec 0.0
+#define MK_HI_us_spec 1.0
+#define MK_DEF_us_spec 0.0
+#define MK_LO_low_input 0.0
+#define MK_HI_low_input 1.0
+#define MK_DEF_low_input 0.0
+#define MK_LO_presence 0.0
+#define MK_HI_presence 1.0
+#define MK_DEF_presence 0.0
+#define MK_LO_cab_load 0.0
+#define MK_HI_cab_load 1.0
+#define MK_DEF_cab_load 0.0
+#define MK_LO_bypass 0.0
+#define MK_HI_bypass 1.0
+#define MK_DEF_bypass 0.0
+#define MK_LO_power 0.0
+#define MK_HI_power 1.0
+#define MK_DEF_power 1.0
+#define MK_LO_hum 0.0
+#define MK_HI_hum 1.0
+#define MK_DEF_hum 0.0
+#define MK_LO_hiss 0.0
+#define MK_HI_hiss 1.0
+#define MK_DEF_hiss 0.0
+#define MK_LO_era 0.0
+#define MK_HI_era 1.0
+#define MK_DEF_era 1.0
+#define MK_LO_head 0.0
+#define MK_HI_head 2.0
+#define MK_DEF_head 0.0
+#define MK_LO_bypass_preamp 0.0
+#define MK_HI_bypass_preamp 1.0
+#define MK_DEF_bypass_preamp 0.0
+#define MK_LO_bypass_power 0.0
+#define MK_HI_bypass_power 1.0
+#define MK_DEF_bypass_power 0.0
+#define MK_LO_fx_loop 0.0
+#define MK_HI_fx_loop 1.0
+#define MK_DEF_fx_loop 0.0
+#define MK_LO_fx_mix 0.0
+#define MK_HI_fx_mix 100.0
+#define MK_DEF_fx_mix 100.0
+#define MK_LO_fx_return_lvl 0.0
+#define MK_HI_fx_return_lvl 2.0
+#define MK_DEF_fx_return_lvl 1.0
+#define MK_LO_engine 1.0
+#define MK_HI_engine 2.0
+#define MK_DEF_engine 2.0
+#define MK_LO_hq 0.0
+#define MK_HI_hq 1.0
+#define MK_DEF_hq 0.0
+#define MK_LO_fx_level 0.0
+#define MK_HI_fx_level 1.0
+#define MK_DEF_fx_level 1.0
 static inline const MkText *mk_text(int index) {
   for (int i = 0; i < MK_N_TEXTS; i++) if (MK_TEXTS[i].index == index) return &MK_TEXTS[i];
   return 0;
