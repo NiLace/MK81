@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_mna.c @ c0e3536, sha256 a79918be29e59ba7536476f9949f1a49aa239ea854e53a0c7c442132b835c344 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_mna.c @ d75dee0, sha256 a79918be29e59ba7536476f9949f1a49aa239ea854e53a0c7c442132b835c344 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* mks_mna.c - the MK Silver preamp as a sparse nodal system, reduced to its nonlinear nodes.
  *

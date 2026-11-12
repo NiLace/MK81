@@ -147,9 +147,9 @@ Pre-Amp, the LOW input, and the guitar's volume knob, which cleans the amp up as
 drive, put a boost in front. This is a starting point, not a measurement: there is no calibrated guitar to read a
 voltage from.
 
-**How much it reacts.** The table shows how hard a held open A string (110 Hz) is distorted, at peak input levels
+**How much it reacts.** The table shows how hard a steady 110 Hz tone (the pitch of the open A string) is distorted, at peak input levels
 from −36 dBFS to 0 dBFS. It was measured on the 100 W EL34 version, with Master full and the other controls at their
-defaults (1.4.0, 2x):
+defaults (1.4.0 at 2x, rendered offline: a sound figure, not a speed one, so it does not depend on the computer):
 
 | Pre-Amp | −36 dBFS | −30 | −24 | −18 | −12 | −6 | 0 dBFS |
 |---|---|---|---|---|---|---|---|

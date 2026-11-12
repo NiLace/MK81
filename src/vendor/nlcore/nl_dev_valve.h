@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_dev_valve.h @ c0e3536, sha256 0b182272cce070881984977261824430f8e7c4f4f818391b25c403d1b7d7d822 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_dev_valve.h @ d75dee0, sha256 0b182272cce070881984977261824430f8e7c4f4f818391b25c403d1b7d7d822 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* nl_dev_valve.h - the shared engine's VALVES (nlcore#14, piece 1 of the amps on the core, nlcore#13): the laws MK81's exact
  * engine ships, moved here so every amp on the core starts from them. Each valve is a BLOCK of coupled ports evaluated at

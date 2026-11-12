@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_mna_valves.h @ c0e3536, sha256 ce074978f9d315b953ab50edff72ea6cee93a9852481675f8c9ad74513389732 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_mna_valves.h @ d75dee0, sha256 ce074978f9d315b953ab50edff72ea6cee93a9852481675f8c9ad74513389732 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* nl_mna_valves.h - the amp solver's device (nlcore#13): the circuit's valves as port BLOCKS over nl_dev_valve.h, in the
  * generated circuit's port order (mks_preamp_circuit.h): MKS_N_TRIODES 12AX7 blocks of 2 ports first, then MKS_N_PENTODES

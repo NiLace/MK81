@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_dev_zener.h @ c0e3536, sha256 72f3b4cdddf5f5c2708a98b3595b10e5de7baa1bafe12ba55944ccb803d37370 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_dev_zener.h @ d75dee0, sha256 72f3b4cdddf5f5c2708a98b3595b10e5de7baa1bafe12ba55944ccb803d37370 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* nl_dev_zener.h - a zener diode as ONE port (nlcore#25, MK81#165). Header only, no policy: nothing in the
  * core includes it; a circuit that has a zener includes it in its device code.

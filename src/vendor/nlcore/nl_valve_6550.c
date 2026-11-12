@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_valve_6550.c @ c0e3536, sha256 b3748489ad16c59dfccd3c0188ba71424afd2d69bf0857d8186d5d4ce1ef7ca2 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_valve_6550.c @ d75dee0, sha256 b3748489ad16c59dfccd3c0188ba71424afd2d69bf0857d8186d5d4ce1ef7ca2 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* nl_valve_6550.c - the 6550 pentode (the export edition's): the EL34's law with our own fit to the 6550 sheet (MK81 
 pentode_own.py --fit, the 6550 set), no cutoff tail. Ports and tables as the EL34's.

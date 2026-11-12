@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_mna_pi_load.h @ c0e3536, sha256 8c647e1d7f4186182ae4ca689f87ef377a16f51e6927ba4483f0ba8fa77bcc22 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_mna_pi_load.h @ d75dee0, sha256 8c647e1d7f4186182ae4ca689f87ef377a16f51e6927ba4483f0ba8fa77bcc22 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* mks_pi_load.h - the phase inverter's input load (at pg1) against PRESENCE, as a table.
  *

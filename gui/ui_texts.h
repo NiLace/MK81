@@ -31,7 +31,7 @@ static const MkText MK_TEXTS[] = {
   { 26, "fx_mix", "FX Mix", "Ignored: the effects loop is series only. Kept so saved sessions load." },
   { 27, "fx_return_lvl", "FX Return Level", "Level of the effects return before it reaches the power amp." },
   { 28, "engine", "Engine", "The amp's engine (fixed: the whole amp solved as one circuit). Kept so saved sessions load." },
-  { 29, "hq", "High Quality", "High quality: the Ultra engine at 4x oversampling (off = 2x, the default), about 1.5-1.7 times the CPU." },
+  { 29, "hq", "High Quality", "High quality: the Ultra engine at 4x oversampling (off = 2x, the default), about 1.7-1.9 times the CPU." },
   { 30, "fx_level", "FX Loop Level", "FX loop level: Line = hot send (about a third of the master signal), Pedal = guitar-level send." },
 };
 #define MK_N_TEXTS 31

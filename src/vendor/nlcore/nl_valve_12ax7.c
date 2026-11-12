@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_valve_12ax7.c @ c0e3536, sha256 259cd0c9b31d25816543b40fa4fc87fc70a35945398ee80c0917152d0be2e4f3 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_valve_12ax7.c @ d75dee0, sha256 259cd0c9b31d25816543b40fa4fc87fc70a35945398ee80c0917152d0be2e4f3 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* nl_valve_12ax7.c - the 12AX7 (ECC83) triode: Dempwolf & Zoelzer (DAFx-11) eqs. 10-12, softplus_C(x) = log1p(e^Cx)/C, Ik = G 
 softplus_C(Va/mu + Vg)^gamma, Ig = Gg softplus_Cg(Vg)^xi + Ig0, Ia = (Ik - Ig) block(Va) + gmin Va; the cathode constants 

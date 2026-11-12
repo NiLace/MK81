@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_mna_device.h @ c0e3536, sha256 a2b8cac3aca793880d394d5aca55425ce7deb5050257ef7a98fc11b78f05c902 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_mna_device.h @ d75dee0, sha256 a2b8cac3aca793880d394d5aca55425ce7deb5050257ef7a98fc11b78f05c902 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* mks_device.h - the MK Silver preamp's nonlinear ports (see mks_device.c). */
 #ifndef MKS_DEVICE_H

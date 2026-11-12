@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* VENDORED from nlcore/nl_valve_el34.c @ c0e3536, sha256 d5ae9a9e871f25e4f9a24477c1913c743f62871f0915bf9194c4478f229fbb78 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
+/* VENDORED from nlcore/nl_valve_el34.c @ d75dee0, sha256 d5ae9a9e871f25e4f9a24477c1913c743f62871f0915bf9194c4478f229fbb78 - never edit here: change the core in the nlcore repository, pass its gate (make test), re-vendor (nlcore tools/vendor.py) */
 /* Copyright (C) The NL Sounds contributors */
 /* nl_valve_el34.c - the EL34 pentode: our own fit to the 1969 sheet (MK81 dsp/prototype/pentode_own.py --fit), a Koren-type 
 cathode current Ik = G E1^gamma with E1 = (g2/KP) log1p(exp(KP (1/MU2 + w/g2))), w = vg1k + vak/MUA, g2 = max(vg2k, 1), the 

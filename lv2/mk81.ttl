@@ -25,7 +25,7 @@
 	lv2:project <https://nylarea.com/nlsounds> ;
 	doap:name "MK 81" ;
 	lv2:minorVersion 4 ;
-	lv2:microVersion 0 ;
+	lv2:microVersion 2 ;
 	doap:license <https://spdx.org/licenses/AGPL-3.0-only> ;
 	rdfs:comment "A British valve amp head of the 1980s, modelled from its circuit: 100 W or 50 W, EL34 or 6550." ;
 
@@ -312,7 +312,7 @@
 		lv2:maximum 1.0 ;
 		lv2:portProperty lv2:integer , lv2:toggled ;
 		lv2:scalePoint [ rdfs:label "2x" ; rdf:value 0.0 ] , [ rdfs:label "4x" ; rdf:value 1.0 ] ;
-		rdfs:comment "High quality: the Ultra engine at 4x oversampling (off = 2x, the default), about 1.5-1.7 times the CPU." ;
+		rdfs:comment "High quality: the Ultra engine at 4x oversampling (off = 2x, the default), about 1.7-1.9 times the CPU." ;
 	] , [
 		a lv2:InputPort , lv2:ControlPort ;
 		lv2:index 30 ;

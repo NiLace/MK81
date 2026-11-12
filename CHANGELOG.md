@@ -7,6 +7,15 @@ Versions follow the LV2 rules: the plugin's URI is the major version, so a relea
 
 ---
 
+## 1.4.2 — 11-Nov-2026
+
+- **The 12AX7's plate-to-cathode capacitance is now the data sheet's 0.46 pF** in every preamp stage and the phase
+  inverter (it was 0.5 pF, a value taken from another valve model). The other two capacitances already matched the sheet.
+  The sound moves very slightly at full gain and stays below what the playing masks.
+- HQ's cost is now stated as measured: about 1.7 to 1.9 times the CPU of 2x (the 1.4.0 texts said 1.6 to 1.8 and 1.5 to
+  1.7).
+- The `hq` and `fx_level` ports joined the list of names that never change, so sessions saved with 1.4.x keep loading.
+
 ## 1.4.0 — 11-Nov-2026
 
 - **A new engine: the whole amplifier is now one circuit, solved sample by sample.** The preamp, the phase inverter,
